@@ -73,8 +73,16 @@ def build_report(trades: list, report_date: str, capital: float = 10000.0) -> st
     ret_pct    = total_pnl / capital * 100
     equity_end = capital + total_pnl
 
-    # theta drag
-    total_theta = sum(float_val(t, 'theta_drag_pnl') for t in trades)
+    # cost components
+    total_theta    = sum(float_val(t, 'theta_drag_pnl')    for t in trades)
+    total_gross    = sum(float_val(t, 'gross_pnl', float_val(t, 'pnl')) for t in trades)
+    total_charges  = sum(float_val(t, 'total_charges')     for t in trades)
+    total_spread   = sum(float_val(t, 'total_spread_cost') for t in trades)
+    total_brok     = sum(float_val(t, 'brokerage')         for t in trades)
+    total_stt      = sum(float_val(t, 'stt')               for t in trades)
+    real_ltp_count = sum(1 for t in trades if t.get('ltp_source') == 'REAL')
+    avg_e_slip     = (sum(float_val(t, 'entry_slip_pct') for t in trades) / n) if n else 0
+    avg_x_slip     = (sum(float_val(t, 'exit_slip_pct')  for t in trades) / n) if n else 0
 
     # CE vs PE
     ce_trades  = [t for t in trades if t.get('option_type', '') == 'CE']
@@ -101,8 +109,13 @@ def build_report(trades: list, report_date: str, capital: float = 10000.0) -> st
     lines.append("  " + "-" * 40)
     lines.append(f"  Starting capital  : Rs {capital:>12,.2f}")
     lines.append(f"  Ending equity     : Rs {equity_end:>12,.2f}")
-    lines.append(f"  Day P&L           : Rs {total_pnl:>+12,.2f}  ({ret_pct:+.2f}%)")
-    lines.append(f"  Theta drag total  : Rs {total_theta:>+12,.2f}  (time decay cost)")
+    lines.append(f"  Gross P&L         : Rs {total_gross:>+12,.2f}  (before all costs)")
+    lines.append(f"  Brokerage + STT   : Rs {-total_charges:>+12,.2f}  (Angel One real charges)")
+    lines.append(f"  Bid-ask spread    : Rs {-total_spread:>+12,.2f}  (execution friction)")
+    lines.append(f"  Theta drag        : Rs {total_theta:>+12,.2f}  (time decay)")
+    lines.append(f"  Net P&L (live eq) : Rs {total_pnl:>+12,.2f}  ({ret_pct:+.2f}%)  <- live equivalent")
+    lines.append(f"  LTP source        : {real_ltp_count}/{n} trades used real API price")
+    lines.append(f"  Avg slippage      : entry {avg_e_slip:.3f}%  exit {avg_x_slip:.3f}%")
     lines.append("")
 
     # ---------------------------------------------------------------
@@ -135,39 +148,41 @@ def build_report(trades: list, report_date: str, capital: float = 10000.0) -> st
     # ---------------------------------------------------------------
     # Per-trade detail
     # ---------------------------------------------------------------
-    lines.append("  TRADE LOG")
-    lines.append("  " + "-" * 100)
+    lines.append("  TRADE LOG  (Net PnL = Gross - Brokerage - Spread)")
+    lines.append("  " + "-" * 116)
     header = (f"  {'#':<3} {'Time':<13} {'Symbol':<22} {'Dir':<5} "
-              f"{'Entry':>7} {'Exit':>7} {'PnL':>9} {'Theta':>8} "
-              f"{'Hold':>5} {'Reason':<22} {'Conf':>6} {'Result'}")
+              f"{'Entry':>7} {'Fill':>7} {'Gross':>9} {'Chrg':>7} {'Net':>9} "
+              f"{'Hold':>5} {'LTP':>5} {'Reason':<18} {'Conf':>6} {'Result'}")
     lines.append(header)
-    lines.append("  " + "-" * 100)
+    lines.append("  " + "-" * 116)
 
     running_pnl = 0.0
     for i, t in enumerate(trades, 1):
         pnl      = float_val(t, 'pnl')
-        theta    = float_val(t, 'theta_drag_pnl')
+        gross    = float_val(t, 'gross_pnl', pnl)
+        charges  = float_val(t, 'total_charges')
         entry    = float_val(t, 'entry_price')
         exit_p   = float_val(t, 'exit_price')
         hold     = int_val(t, 'hold_mins')
         conf     = float_val(t, 'avg_conf')
         symbol   = t.get('symbol', '')[:22]
         direction= t.get('direction', '')
-        reason   = t.get('exit_reason', '')[:22]
+        reason   = t.get('exit_reason', '')[:18]
         etime    = t.get('entry_time', '')
         xtime    = t.get('exit_time', '')
+        ltp_src  = 'REAL' if t.get('ltp_source') == 'REAL' else 'MODL'
         result   = 'WIN' if pnl > 0 else 'LOSS'
         running_pnl += pnl
 
         lines.append(
             f"  {i:<3} {etime}-{xtime:<7} {symbol:<22} {direction:<5} "
-            f"{entry:>7.2f} {exit_p:>7.2f} {pnl:>+9.2f} {theta:>+8.2f} "
-            f"{hold:>4}m {reason:<22} {conf:>5.1%} {result}  "
+            f"{entry:>7.2f} {exit_p:>7.2f} {gross:>+9.2f} {-charges:>+7.2f} {pnl:>+9.2f} "
+            f"{hold:>4}m {ltp_src:>5} {reason:<18} {conf:>5.1%} {result}  "
             f"(running: Rs {running_pnl:+,.0f})"
         )
 
-    lines.append("  " + "-" * 100)
-    lines.append(f"  {'TOTAL':<70} {total_pnl:>+9.2f}")
+    lines.append("  " + "-" * 116)
+    lines.append(f"  {'TOTAL (net)':<84} {total_pnl:>+9.2f}")
     lines.append("")
 
     # ---------------------------------------------------------------

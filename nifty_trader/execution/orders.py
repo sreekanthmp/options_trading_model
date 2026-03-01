@@ -33,6 +33,9 @@ from ..config import (
     MAX_RISK_PCT, STOP_LOSS_PCT, TARGET_PCT,
     COST_RT_PCT, SLIPPAGE_PCT, THETA_DECAY_PCT, TOTAL_COST_PCT,
     DELTA_BASE, THETA_PTS_PER_BAR, HORIZONS,
+    LIMIT_BUY_BUFFER_PCT, LIMIT_SELL_BUFFER_PCT,
+    LIMIT_FILL_PROB_ATM, LIMIT_FILL_PROB_EXPIRY, LIMIT_FILL_PROB_HIGH_IV,
+    LIMIT_SPREAD_NORMAL_PCT, LIMIT_SPREAD_HIGH_IV_PCT,
 )
 from ..utils.safeguards import safe_value, check_lpp_violation, get_max_oi_strikes, avoid_oi_concentration_zone
 from .costs import effective_cost, get_dynamic_theta
@@ -519,6 +522,106 @@ def vega_entry_filter(iv_rank: float, iv_pct_change_today: float) -> tuple:
     return True, ''
 
 
+def simulate_limit_order(mid_price: float, side: str,
+                         is_expiry: bool = False,
+                         iv_rank: float = 50.0,
+                         rng: np.random.Generator = None) -> dict:
+    """
+    Simulate a LIMIT order fill — mirrors SEBI April 2026 rules (no MARKET orders).
+
+    In live trading you place a LIMIT order at a buffer above/below LTP.
+    This function simulates:
+      1. The limit price you'd submit
+      2. Whether the order fills (fill probability based on market conditions)
+      3. The actual fill price (limit price = worst case; often fills at mid)
+      4. The bid-ask spread cost paid
+
+    Parameters
+    ----------
+    mid_price : float
+        Current mid-price estimate of the option (from estimate_option_premium)
+    side : str
+        'BUY' (entry) or 'SELL' (exit)
+    is_expiry : bool
+        Whether today is expiry day (lower fill prob, wider spreads)
+    iv_rank : float
+        Current IV rank 0-100 (higher = wider spreads, lower fill prob)
+    rng : np.random.Generator
+        Optional seeded RNG for reproducibility in backtests
+
+    Returns
+    -------
+    dict with keys:
+        filled        : bool   — whether the order filled
+        fill_price    : float  — actual execution price (0 if not filled)
+        limit_price   : float  — the limit price submitted
+        spread_cost   : float  — extra cost vs mid due to spread (points)
+        fill_prob     : float  — probability used for this fill attempt
+        slip_pct      : float  — total slippage as % of mid_price
+        order_type    : str    — always 'LIMIT' (never MARKET)
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    high_iv = iv_rank > 70
+
+    # 1. Determine fill probability
+    if is_expiry:
+        fill_prob = LIMIT_FILL_PROB_EXPIRY
+    elif high_iv:
+        fill_prob = LIMIT_FILL_PROB_HIGH_IV
+    else:
+        fill_prob = LIMIT_FILL_PROB_ATM
+
+    # 2. Spread cost component (extra above/below mid due to bid-ask)
+    spread_pct = LIMIT_SPREAD_HIGH_IV_PCT if high_iv else LIMIT_SPREAD_NORMAL_PCT
+
+    # 3. Compute limit price
+    if side == 'BUY':
+        # Submit limit at mid + buy_buffer (willing to pay up to this)
+        limit_price = mid_price * (1.0 + LIMIT_BUY_BUFFER_PCT + spread_pct)
+    else:  # SELL
+        # Submit limit at mid - sell_buffer (willing to accept down to this)
+        limit_price = mid_price * (1.0 - LIMIT_SELL_BUFFER_PCT - spread_pct)
+
+    limit_price = round(max(limit_price, 1.0), 2)
+
+    # 4. Simulate fill
+    filled = rng.random() < fill_prob
+
+    if not filled:
+        return {
+            'filled':     False,
+            'fill_price': 0.0,
+            'limit_price': limit_price,
+            'spread_cost': 0.0,
+            'fill_prob':  fill_prob,
+            'slip_pct':   0.0,
+            'order_type': 'LIMIT',
+        }
+
+    # 5. Fill price: typically between mid and limit (random within that band)
+    # In liquid ATM options, fills often come at mid or very close to it.
+    # We sample uniformly between mid and limit to avoid over-pessimism.
+    if side == 'BUY':
+        fill_price = round(rng.uniform(mid_price, limit_price), 2)
+    else:
+        fill_price = round(rng.uniform(limit_price, mid_price), 2)
+
+    spread_cost = abs(fill_price - mid_price)
+    slip_pct    = spread_cost / (mid_price + 1e-9)
+
+    return {
+        'filled':      True,
+        'fill_price':  fill_price,
+        'limit_price': limit_price,
+        'spread_cost': round(spread_cost, 2),
+        'fill_prob':   fill_prob,
+        'slip_pct':    round(slip_pct, 4),
+        'order_type':  'LIMIT',
+    }
+
+
 def select_option(signal: dict, capital: float, now=None, tick_buffer=None,
                  session: 'AngelSession' = None, position_mgr: 'PositionManager' = None) -> dict:
     """Strike selection and position sizing.
@@ -639,11 +742,25 @@ def select_option(signal: dict, capital: float, now=None, tick_buffer=None,
         )
         return None
 
-    # ---- 6. Cost model (expiry + IV aware) -----------------------------------
+    # ---- 6. LIMIT order simulation (replaces fixed slippage model) -----------
+    # SEBI April 2026: MARKET orders banned for algos. Paper trading now
+    # simulates a LIMIT BUY at LTP + buffer, with realistic fill probability.
     expiry_cost_mult = 2.0 if is_expiry and minute_of_day > 135 else 1.0
-    effective_slip   = SLIPPAGE_PCT   * expiry_cost_mult
-    effective_cost   = TOTAL_COST_PCT * expiry_cost_mult
-    entry_price      = est_premium * (1 + effective_slip)
+    limit_sim = simulate_limit_order(
+        mid_price  = est_premium,
+        side       = 'BUY',
+        is_expiry  = is_expiry,
+        iv_rank    = iv_rank,
+    )
+    if not limit_sim['filled']:
+        logger.info(
+            f"[LimitOrder] ENTRY unfilled — fill_prob={limit_sim['fill_prob']:.0%} "
+            f"limit={limit_sim['limit_price']:.2f}  iv_rank={iv_rank:.0f}"
+        )
+        return None   # Missed fill — same behaviour as a real unexecuted LIMIT order
+
+    entry_price   = limit_sim['fill_price']
+    effective_cost = COST_RT_PCT * expiry_cost_mult   # brokerage + taxes only (no slippage — captured above)
 
     # ---- 7. PREMIUM-BASED stop loss (not underlying-based) -------------------
     # Stop is expressed as % of the option PREMIUM paid.
@@ -721,7 +838,7 @@ def select_option(signal: dict, capital: float, now=None, tick_buffer=None,
         # PREMIUM-BASED stop (key safety fix)
         'stop_price':       round(stop_price, 2),
         'stop_pct':         round(premium_stop_pct * 100, 1),
-        'stop_basis':       'PREMIUM',   # explicit tag so caller knows stop type
+        'stop_basis':       'PREMIUM',
         'target_price':     round(target_price, 2),
         'breakeven':        round(breakeven, 2),
         'notional':         round(entry_price * contracts * lot_size, 2),
@@ -734,6 +851,12 @@ def select_option(signal: dict, capital: float, now=None, tick_buffer=None,
         'iv_rank':          round(iv_rank, 1),
         'delta_entry':      round(delta_entry, 3),
         'expiry_rule_tag':  expiry_rule.get('tag', 'NORMAL'),
+        # LIMIT order execution details (for paper trade analysis)
+        'limit_price':      round(limit_sim['limit_price'], 2),
+        'limit_slip_pct':   round(limit_sim['slip_pct'] * 100, 3),
+        'limit_spread_cost':round(limit_sim['spread_cost'], 2),
+        'limit_fill_prob':  round(limit_sim['fill_prob'], 2),
+        'order_type':       'LIMIT',
     }
 
 

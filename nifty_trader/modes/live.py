@@ -631,9 +631,28 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
             pos = paper._position
             bars_open = int((now - pos['entry_time']).total_seconds() / 60)
             dte_entry = pos.get('dte_mins_entry', 750.0)
-            dte_now = max(30.0, dte_entry - bars_open)  # Current DTE
-            ltp_est = option_pnl_estimate(pos['entry_price'], pos['spot_entry'],
-                                          spot_now, atr_now, pos['direction'], bars_open, dte_now)
+            dte_now = max(30.0, dte_entry - bars_open)
+
+            # Use REAL option LTP from Angel One API when available.
+            # This is the single most important realism fix: in live trading,
+            # your P&L and stop triggers are based on the actual market price
+            # of the option, not a model estimate.
+            # row['atm_ce_ltp'] / row['atm_pe_ltp'] are fetched every bar above.
+            opt_type  = pos.get('option_type', 'CE')
+            real_ltp_key = 'atm_ce_ltp' if opt_type == 'CE' else 'atm_pe_ltp'
+            real_ltp  = float(row.get(real_ltp_key, 0.0))
+
+            # Model estimate as fallback when real LTP is unavailable (API miss)
+            ltp_model = option_pnl_estimate(pos['entry_price'], pos['spot_entry'],
+                                            spot_now, atr_now, pos['direction'],
+                                            bars_open, dte_now)
+
+            if real_ltp > 0:
+                ltp_est = real_ltp   # Live: use real market price
+                pos['_using_real_ltp'] = True
+            else:
+                ltp_est = ltp_model  # Fallback: model estimate
+                pos['_using_real_ltp'] = False
 
             # Running MAE/MFE tracking for the trade logger
             _ep    = pos['entry_price']

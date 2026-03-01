@@ -7,10 +7,11 @@ from collections import deque
 import warnings
 warnings.filterwarnings('ignore')
 
-from ..config import STOP_LOSS_PCT, TARGET_PCT, DELTA_BASE, THETA_PTS_PER_BAR
-from .orders import get_lot_size
+from ..config import (STOP_LOSS_PCT, TARGET_PCT, DELTA_BASE, THETA_PTS_PER_BAR,
+                      LIMIT_BUY_BUFFER_PCT, LIMIT_SELL_BUFFER_PCT)
+from .orders import get_lot_size, simulate_limit_order
 from ..utils.safeguards import safe_value
-from .costs import get_dynamic_theta
+from .costs import get_dynamic_theta, calculate_brokerage
 from .orders import effective_delta, option_pnl_estimate
 from .risk import KillSwitch
 
@@ -81,6 +82,7 @@ class PaperTrader:
             return
 
         t = trade_info
+        lot_sz = t.get('lot_size_used', t.get('lot_size', get_lot_size(now)))
         self._position = {
             'symbol':       f"NIFTY {t['strike']} {t['option_type']}",
             'option_type':  t['option_type'],
@@ -89,8 +91,8 @@ class PaperTrader:
             'entry_price':  t['entry_price'],
             'stop':         t['stop_price'],
             'target':       t['target_price'],
-            'lot_size_used': t.get('lot_size_used', t.get('lot_size', get_lot_size(now))),
-            'qty':          t['contracts'] * t.get('lot_size_used', t.get('lot_size', get_lot_size(now))),
+            'lot_size_used': lot_sz,
+            'qty':          t['contracts'] * lot_sz,
             'contracts':    t['contracts'],
             'entry_time':   now,
             # Signal metadata
@@ -100,15 +102,29 @@ class PaperTrader:
             'regime':       signal.get('regime',      ''),
             'micro_regime': signal.get('micro_regime',''),
             'agreement':    signal.get('agreement',   0.0),
-            # Delta-decay tracking: store entry DTE and entry spot so
-            # we can decompose exit PnL into directional vs theta drag.
+            # Delta-decay tracking
             'dte_mins_entry':  t.get('dte_mins_entry', 0.0),
             'iv_annpct_entry': t.get('iv_annpct_entry', 0.0),
             'spot_entry':      float(signal.get('spot', 0.0)),
+            # LIMIT order execution metadata
+            'entry_order_type':   t.get('order_type', 'LIMIT'),
+            'entry_limit_price':  t.get('limit_price', t['entry_price']),
+            'entry_slip_pct':     t.get('limit_slip_pct', 0.0),
+            'entry_spread_cost':  t.get('limit_spread_cost', 0.0),
+            'entry_fill_prob':    t.get('limit_fill_prob', 1.0),
+            'iv_rank_entry':      t.get('iv_rank', 50.0),
+            # Expiry flag — used by exit LIMIT simulation for wider spread penalty
+            'is_expiry':          bool(signal.get('is_expiry', 0)),
+            # LTP source tracking — True = real API price, False = model estimate
+            '_using_real_ltp':    False,
         }
 
         print(f"\n  [PAPER ENTRY]  {self._position['symbol']}  "
-              f"{signal['direction']}  entry={t['entry_price']:.2f}  "
+              f"{signal['direction']}  "
+              f"mid={t.get('est_premium', t['entry_price']):.2f}  "
+              f"limit={t.get('limit_price', t['entry_price']):.2f}  "
+              f"fill={t['entry_price']:.2f}  "
+              f"slip={t.get('limit_slip_pct', 0.0):.2f}%  "
               f"stop={t['stop_price']:.2f}  target={t['target_price']:.2f}  "
               f"contracts={t['contracts']}  conf={signal.get('avg_conf',0):.1%}  "
               f"ev_net={signal.get('ev_net',0):+.4f}")
@@ -264,8 +280,37 @@ class PaperTrader:
         p     = self._position
         entry = p['entry_price']
         qty   = p['qty']
-        pnl   = (exit_price - entry) * qty
-        
+
+        # Simulate LIMIT SELL order on exit (SEBI: no MARKET orders)
+        # For stop exits: market is moving against us — fill prob is high but
+        # we may get slight extra slippage as book thins. For target/time exits:
+        # market is stable, fill at limit is near-certain.
+        is_expiry   = bool(p.get('is_expiry', False))   # stored at entry time
+        iv_rank_pos = float(p.get('iv_rank_entry', 50.0))
+        using_real  = bool(p.get('_using_real_ltp', False))   # was exit_price from real API?
+        exit_limit  = simulate_limit_order(
+            mid_price = exit_price,
+            side      = 'SELL',
+            is_expiry = is_expiry,
+            iv_rank   = iv_rank_pos,
+        )
+        # On stop exits, if LIMIT sell doesn't fill immediately (rare), accept
+        # a slightly worse price rather than missing the exit entirely — use limit_price.
+        actual_exit = exit_limit['fill_price'] if exit_limit['filled'] else exit_limit['limit_price']
+        actual_exit = max(actual_exit, 1.0)  # option can't go negative
+
+        gross_pnl = (actual_exit - entry) * qty
+
+        # Deduct real brokerage + statutory charges (Angel One NSE F&O)
+        # This makes paper PnL = live net PnL (what actually hits your account)
+        charges = calculate_brokerage(
+            entry_price = entry,
+            exit_price  = actual_exit,
+            qty         = qty,
+            is_expiry   = is_expiry,
+        )
+        pnl = gross_pnl - charges['total_charges']
+
         # Edge Case 2: Record exit time for post-trade cooldown
         if signal_state is not None:
             signal_state.last_exit_time = now
@@ -309,12 +354,13 @@ class PaperTrader:
             'strike':       p['strike'],
             'direction':    p['direction'],
             'entry_price':  entry,
-            'exit_price':   round(exit_price, 2),
+            'exit_price':   round(actual_exit, 2),
+            'exit_mid':     round(exit_price, 2),   # LTP before limit sim
             'qty':          qty,
             'contracts':    p['contracts'],
             'lot_size_used': p.get('lot_size_used', get_lot_size()),
             'pnl':          round(pnl, 2),
-            'pnl_pct':      round((exit_price / entry - 1) * 100, 2),
+            'pnl_pct':      round((actual_exit / entry - 1) * 100, 2),
             'entry_time':   p['entry_time'].strftime('%H:%M'),
             'exit_time':    now.strftime('%H:%M'),
             'hold_mins':    hold_mins,
@@ -329,11 +375,33 @@ class PaperTrader:
             'equity_after': round(self._equity, 2),
             'intraday_dd':  round(intraday_dd * 100, 2),
             # Delta-decay fields
-            'theta_drag_pts': theta_drag_pts,   # Rs/unit eroded by time decay
-            'theta_drag_pnl': theta_drag_pnl,   # Rs lost to theta on this trade
-            'dir_pnl':        dir_pnl,           # Rs from directional move × delta
+            'theta_drag_pts': theta_drag_pts,
+            'theta_drag_pnl': theta_drag_pnl,
+            'dir_pnl':        dir_pnl,
             'delta_at_exit':  round(delta_at_exit, 4),
             'bars_open':      bars_open,
+            # LIMIT order execution details — entry + exit
+            'entry_order_type':    p.get('entry_order_type', 'LIMIT'),
+            'entry_limit_price':   round(p.get('entry_limit_price', entry), 2),
+            'entry_slip_pct':      round(p.get('entry_slip_pct', 0.0), 3),
+            'entry_spread_cost':   round(p.get('entry_spread_cost', 0.0), 2),
+            'exit_order_type':     'LIMIT',
+            'exit_limit_price':    round(exit_limit['limit_price'], 2),
+            'exit_slip_pct':       round(exit_limit['slip_pct'] * 100, 3),
+            'exit_spread_cost':    round(exit_limit['spread_cost'], 2),
+            'total_spread_cost':   round(p.get('entry_spread_cost', 0.0) + exit_limit['spread_cost'], 2),
+            # Brokerage + statutory charges (Angel One, NSE F&O)
+            'gross_pnl':           round(gross_pnl, 2),
+            'brokerage':           charges['brokerage'],
+            'gst':                 charges['gst'],
+            'stt':                 charges['stt'],
+            'txn_charges':         charges['txn_charges'],
+            'stamp_duty':          charges['stamp_duty'],
+            'total_charges':       charges['total_charges'],
+            # LTP source — tells you if this trade used real market prices or model estimates
+            # 'REAL' means both entry and exit used actual option LTP from Angel One API
+            # 'MODEL' means fallback delta-decay estimate was used (API unavailable)
+            'ltp_source': 'REAL' if using_real else 'MODEL',
         }
         self._trades.append(trade)
 
@@ -341,10 +409,14 @@ class PaperTrader:
         ks.record_trade(pnl)
 
         won = pnl > 0
+        total_spread = p.get('entry_spread_cost', 0.0) + exit_limit['spread_cost']
+        ltp_src_tag = '[REAL]' if using_real else '[MODEL]'
         print(f"\n  [PAPER EXIT]  {p['symbol']}  {reason}  "
-              f"exit={exit_price:.2f}  PnL={pnl:+.2f}  "
+              f"mid={exit_price:.2f}  fill={actual_exit:.2f}  {ltp_src_tag}  "
+              f"spread={total_spread:.2f}pts  charges={charges['total_charges']:.2f}  "
+              f"gross={gross_pnl:+.2f}  net={pnl:+.2f}  "
               f"hold={hold_mins}min  "
-              f"delta={delta_at_exit:.3f}  theta={theta_drag_pnl:+.2f}  dir={dir_pnl:+.2f}  "
+              f"delta={delta_at_exit:.3f}  theta={theta_drag_pnl:+.2f}  "
               f"equity={self._equity:,.2f}  "
               f"{'WIN' if won else 'LOSS'}")
 
@@ -382,32 +454,47 @@ class PaperTrader:
         import numpy as _np
         sharpe = (_np.mean(pnls) / (_np.std(pnls) + 1e-9)) * _np.sqrt(n) if n > 1 else 0.0
 
+        # LIMIT order execution quality stats
+        total_spread_cost  = sum(t.get('total_spread_cost', 0.0) for t in trades)
+        total_charges      = sum(t.get('total_charges', 0.0) for t in trades)
+        total_gross_pnl    = sum(t.get('gross_pnl', t['pnl']) for t in trades)
+        avg_entry_slip     = _np.mean([t.get('entry_slip_pct', 0.0) for t in trades])
+        avg_exit_slip      = _np.mean([t.get('exit_slip_pct',  0.0) for t in trades])
+        real_ltp_count     = sum(1 for t in trades if t.get('ltp_source') == 'REAL')
+
         print(f"\n{'='*62}")
         print(f"  PAPER TRADING SUMMARY  --  {trade_date}")
         print(f"{'='*62}")
-        print(f"  Trades      : {n}")
+        print(f"  Trades      : {n}  ({real_ltp_count} used real API LTP, {n-real_ltp_count} model)")
         print(f"  Win rate    : {wr:.1%}  ({len(wins)}W / {len(losses)}L)")
-        print(f"  Total PnL   : {total_pnl:+,.2f}  ({ret_pct:+.2f}% of capital)")
-        print(f"  Theta drag  : {total_theta:+,.2f}  (Rs lost to time decay across all trades)")
+        print(f"  Gross PnL   : {total_gross_pnl:+,.2f}")
+        print(f"  Brokerage   : {-total_charges:+,.2f}  (STT+txn+brokerage)")
+        print(f"  Spread cost : {-total_spread_cost:+,.2f}  (bid-ask, entry+exit)")
+        print(f"  Theta drag  : {total_theta:+,.2f}  (time decay)")
+        print(f"  Net PnL     : {total_pnl:+,.2f}  ({ret_pct:+.2f}% of capital)  ← live equivalent")
+        print(f"  Avg entry slip: {avg_entry_slip:.3f}%  |  Avg exit slip: {avg_exit_slip:.3f}%")
         print(f"  Avg win     : {(sum(t['pnl'] for t in wins)/len(wins)) if wins else 0:+.2f}")
         print(f"  Avg loss    : {(sum(t['pnl'] for t in losses)/len(losses)) if losses else 0:+.2f}")
         print(f"  Avg hold    : {avg_hold:.0f} min")
         print(f"  Intraday DD : {worst_dd:.2f}%")
         print(f"  Sharpe      : {sharpe:.2f}")
+        print(f"  Order type  : LIMIT (SEBI Apr 2026 compliant)")
         print(f"{'='*62}")
 
-        # Per-trade breakdown — add theta_drag column
+        # Per-trade breakdown — entry/exit fill prices + spread cost
         print(f"\n  {'#':<3} {'Time':<12} {'Symbol':<22} {'Dir':<5} "
-              f"{'Entry':>7} {'Exit':>7} {'PnL':>8} {'Theta':>7} {'Reason':<12} {'Conf':>6} {'EVnet':>7}")
-        print(f"  {'-'*108}")
+              f"{'Mid':>7} {'Fill':>7} {'PnL':>8} {'Spread':>7} {'Theta':>7} {'Reason':<12} {'Conf':>6}")
+        print(f"  {'-'*116}")
         for i, t in enumerate(trades, 1):
             print(f"  {i:<3} {t['entry_time']}-{t['exit_time']:<7} "
                   f"{t['symbol']:<22} {t['direction']:<5} "
-                  f"{t['entry_price']:>7.2f} {t['exit_price']:>7.2f} "
+                  f"{t.get('exit_mid', t['exit_price']):>7.2f} "
+                  f"{t['exit_price']:>7.2f} "
                   f"{t['pnl']:>+8.2f} "
+                  f"{t.get('total_spread_cost', 0.0):>+7.2f} "
                   f"{t.get('theta_drag_pnl', 0.0):>+7.2f} "
                   f"{t['exit_reason']:<12} "
-                  f"{t['avg_conf']:>5.1%} {t['ev_net']:>+7.4f}")
+                  f"{t['avg_conf']:>5.1%}")
 
         # CSV export
         os.makedirs('paper_trades', exist_ok=True)

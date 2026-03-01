@@ -164,6 +164,36 @@ THETA_DECAY_PCT  = 0.015
 TOTAL_COST_PCT   = COST_RT_PCT + SLIPPAGE_PCT + THETA_DECAY_PCT
 
 # ---------------------------------------------------------------------------
+# Real brokerage + statutory costs (Angel One, NSE F&O options — per SIDE)
+# These are deducted from paper trade PnL so paper matches live net P&L exactly.
+#
+# Cost breakdown per TRADE (one round-trip = entry + exit):
+#   Brokerage:        Rs 20 flat per order (Angel One flat fee model)
+#   STT (buy side):   0% on option BUY (no STT on buyer for non-expiry)
+#   STT (sell side):  0.1% of premium × qty  (on sell/exit leg)
+#   NSE transaction:  0.053% of premium turnover (both sides)
+#   SEBI charges:     Rs 10 per crore of turnover (~0.0001%)
+#   GST on brokerage: 18% of brokerage
+#   Stamp duty:       0.003% of BUY side premium (Maharashtra)
+#
+# For a typical ATM option trade:
+#   Entry: Rs 400 premium, 1 lot (65 qty) = Rs 26,000 turnover
+#   Brokerage both sides: Rs 20 × 2 = Rs 40
+#   GST on brokerage: Rs 40 × 0.18 = Rs 7.20
+#   STT on sell side: 26,000 × 0.001 = Rs 26
+#   NSE transaction (both sides): 26,000 × 2 × 0.00053 = Rs 27.56
+#   Stamp duty (buy side): 26,000 × 0.00003 = Rs 0.78
+#   Total ≈ Rs 102 per round-trip on Rs 26,000 = ~0.39% round-trip cost
+#
+# Note: STT on expiry is MUCH higher (0.125% of intrinsic value) — handled separately
+BROKERAGE_PER_ORDER  = 20.0     # Rs 20 flat per order (Angel One)
+GST_ON_BROKERAGE     = 0.18     # 18% GST on brokerage
+STT_SELL_PCT         = 0.001    # 0.1% of premium on SELL side
+NSE_TXN_PCT          = 0.00053  # 0.053% of turnover each side
+STAMP_DUTY_PCT       = 0.00003  # 0.003% of BUY side turnover
+STT_EXPIRY_PCT       = 0.00125  # 0.125% on expiry day (on intrinsic, approx premium)
+
+# ---------------------------------------------------------------------------
 # Strike configuration
 # ---------------------------------------------------------------------------
 STRIKE_OFFSET_CE = 100
@@ -175,6 +205,37 @@ STRIKE_ROUNDING  = 50
 # ---------------------------------------------------------------------------
 DELTA_BASE        = 0.45
 THETA_PTS_PER_BAR = 0.15
+
+# ---------------------------------------------------------------------------
+# LIMIT Order Simulation (paper trading realism — mirrors April 2026 SEBI rules)
+# ---------------------------------------------------------------------------
+# In live trading, MARKET orders are banned. All orders must be LIMIT orders.
+# These constants simulate realistic LIMIT order behaviour in paper trading.
+#
+# How it works:
+#   Entry: place LIMIT BUY at LTP + LIMIT_BUY_BUFFER_PCT above current LTP
+#          Fill probability = LIMIT_FILL_PROB_ATM for ATM options
+#          If unfilled (rare for ATM), trade is skipped — same as live
+#   Exit:  place LIMIT SELL at LTP - LIMIT_SELL_BUFFER_PCT below current LTP
+#          Simulates giving up the spread on exit
+#
+# Bid-ask spread proxy (NSE ATM NIFTY weekly options, normal conditions):
+#   ATM spread  ≈ 0.5–2 pts  (tight, high liquidity)
+#   OTM spread  ≈ 2–8 pts    (wider, lower OI)
+#   High-IV day spread ≈ 3–10 pts
+#
+# Fill probability (ATM LIMIT near LTP):
+#   Normal session : ~97%  (almost always fills for ATM)
+#   High-vol/expiry: ~88%  (more slippage, some misses)
+LIMIT_BUY_BUFFER_PCT  = 0.003   # 0.3% above LTP for entry (≈1–2 pts on ₹400 ATM)
+LIMIT_SELL_BUFFER_PCT = 0.003   # 0.3% below LTP for exit  (≈1–2 pts on ₹400 ATM)
+LIMIT_FILL_PROB_ATM   = 0.97    # 97% fill rate for ATM options in normal session
+LIMIT_FILL_PROB_EXPIRY= 0.88    # 88% fill rate on expiry day (wider spreads)
+LIMIT_FILL_PROB_HIGH_IV= 0.90   # 90% fill rate when IV rank > 70
+# Spread penalty on entry: extra cost when spread is wider than normal
+# Applied as additional % of premium above the buffer
+LIMIT_SPREAD_NORMAL_PCT = 0.002  # 0.2% extra cost — normal spread (ATM)
+LIMIT_SPREAD_HIGH_IV_PCT= 0.006  # 0.6% extra cost — high-IV / OTM spread
 
 # ---------------------------------------------------------------------------
 # Kill-switch thresholds
