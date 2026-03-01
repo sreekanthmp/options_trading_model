@@ -1,0 +1,16 @@
+# Ignore everything
+*
+
+# Except the nifty_trader package
+!nifty_trader/
+!nifty_trader/**
+
+# Always ignore sensitive and generated files even inside nifty_trader
+nifty_trader/**/__pycache__/
+nifty_trader/**/*.pyc
+nifty_trader/**/*.pyo
+
+# Top-level exceptions — keep these tracked
+!.gitignore
+!nifty_options_trader.py
+!paper_report.py
