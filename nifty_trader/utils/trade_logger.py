@@ -37,7 +37,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'logs')
-LOT_SIZE = 75   # NIFTY lot size for PnL estimation
+LOT_SIZE = 65   # NIFTY lot size for PnL estimation (updated April 26, 2025)
 
 
 def _safe(v: Any) -> Any:
@@ -173,7 +173,9 @@ class TradeLogger:
     ):
         ep  = entry_price if entry_price is not None else self._open_entry_price
         qty = contracts   if contracts   is not None else self._open_contracts
-        pnl_pts = (exit_price - ep) * (1 if self._open_direction == 'UP' else -1)
+        # Option PnL is always exit - entry: we BUY the option (CE for UP, PE for DOWN)
+        # and profit when it appreciates regardless of direction label.
+        pnl_pts = exit_price - ep
         pnl_pct = pnl_pts / (ep + 1e-9) * 100
 
         record = {

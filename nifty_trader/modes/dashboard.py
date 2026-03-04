@@ -257,6 +257,12 @@ def print_live_dashboard(row: pd.Series, analysis: dict,
             
             # Handle NaN values - replace with 0 before passing to model
             X = np.array([[0.0 if pd.isna(row.get(fc, 0)) else row.get(fc, 0) for fc in active_features]], dtype=np.float32)
+            live_scaler = res.get('live_scaler')
+            if live_scaler is not None:
+                try:
+                    X = live_scaler.transform(X)
+                except Exception:
+                    pass  # use raw if scaler fails
             pr = res['final_model'].predict_proba(X)[0]
             proba_up = float(pr[1])
             conf     = max(proba_up, 1 - proba_up)
@@ -282,7 +288,7 @@ def print_live_dashboard(row: pd.Series, analysis: dict,
         iv_p = row.get('iv_proxy', 0)
         iv   = float(iv_p) if iv_p and iv_p > 0 else float(row.get('atr_14_pct', 0))
         if current_regime == REGIME_CRISIS:
-            reason = "CRISIS regime -- all trades blocked"
+            reason = "CRISIS regime -- gate filtered (check logs for [Gate] BLOCKED)"
         elif sp < 0.10 or sp > 0.92:
             reason = f"Outside trading session window (sp={sp:.2f})"
         elif 180 <= mod2 < 225:
@@ -432,7 +438,7 @@ def print_live_dashboard(row: pd.Series, analysis: dict,
     print(f"  ML Models ({len(h_order)} horizons):  {ml_direction} {ml_symbol}  "
           f"({ml_up_count} UP, {ml_dn_count} DOWN)  Avg Conf: {ml_avg_conf:.1%}")
     print(f"  Technical Analysis:      {tech_direction} {tech_symbol}  Score: {tech_score:+.3f}")
-    print(f"  Agreement:               {'YES' if agreement else 'NO - CONTRADICTING'}")
+    print(f"  Agreement:               {'YES' if agreement else 'NO'}")
     
     # Trading recommendation
     print(sep2)
@@ -452,7 +458,7 @@ def print_live_dashboard(row: pd.Series, analysis: dict,
         iv = float(iv_p) if iv_p and iv_p > 0 else float(row.get('atr_14_pct', 0))
         
         if current_regime == REGIME_CRISIS:
-            block_reason = "Crisis regime detected"
+            block_reason = "Crisis regime (bypass active if agreement>=85% -- see logs)"
         elif sp < 0.10:
             block_reason = "Pre-market session (first 10%)"
         elif sp > 0.92:
@@ -471,28 +477,19 @@ def print_live_dashboard(row: pd.Series, analysis: dict,
             block_reason = "Kill-switch or other filter blocked"
         
         print(f"  NO SIGNAL: {block_reason}")
-        
-        # Actionable recommendation
-        if agreement and ml_avg_conf >= 0.55:
-            # Both agree and decent confidence - cautious recommendation
-            if ml_direction == "BULLISH":
-                print(f"  RECOMMENDATION: Cautious LONG bias - Wait for confirming signal")
-                print(f"    - Monitor for ML confidence to exceed 58% threshold")
-                print(f"    - Consider CE (Call) options if signal triggers")
-            elif ml_direction == "BEARISH":
-                print(f"  RECOMMENDATION: Cautious SHORT bias - Wait for confirming signal")
-                print(f"    - Monitor for ML confidence to exceed 58% threshold")
-                print(f"    - Consider PE (Put) options if signal triggers")
+
+        # Actionable recommendation — only show when the block is not a hard session/regime gate
+        _hard_gate = sp < 0.10 or sp > 0.92 or (180 <= mod < 225) or (row.get('is_expiry', 0) == 1 and mod > 315)
+        if not _hard_gate:
+            if ml_avg_conf >= 0.55:
+                if ml_direction == "BULLISH":
+                    print(f"  RECOMMENDATION: Cautious LONG bias - Wait for confirming signal")
+                elif ml_direction == "BEARISH":
+                    print(f"  RECOMMENDATION: Cautious SHORT bias - Wait for confirming signal")
+                else:
+                    print(f"  RECOMMENDATION: STAY FLAT - No clear directional edge")
             else:
-                print(f"  RECOMMENDATION: STAY FLAT - No clear directional edge")
-        elif not agreement:
-            # Contradiction - stay out
-            print(f"  RECOMMENDATION: STAY OUT - Mixed signals (ML {ml_direction} vs Tech {tech_direction})")
-            print(f"    - Wait for alignment between ML and technical analysis")
-        else:
-            # Low confidence - stay out
-            print(f"  RECOMMENDATION: STAY FLAT - Low confidence ({ml_avg_conf:.1%})")
-            print(f"    - Wait for stronger conviction (>58% confidence)")
+                print(f"  RECOMMENDATION: STAY FLAT - Low confidence ({ml_avg_conf:.1%})")
     
     print(sep2)
     

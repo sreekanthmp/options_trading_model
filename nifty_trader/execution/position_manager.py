@@ -91,6 +91,7 @@ class PaperTrader:
             'entry_price':  t['entry_price'],
             'stop':         t['stop_price'],
             'target':       t['target_price'],
+            'peak_ltp':     t['entry_price'],   # tracks highest LTP seen (for trailing stop)
             'lot_size_used': lot_sz,
             'qty':          t['contracts'] * lot_sz,
             'contracts':    t['contracts'],
@@ -160,18 +161,23 @@ class PaperTrader:
             self._exit('TIME_EXIT', ltp, now, ks, signal_state=signal_state)
             return
 
-        # Time-aware stop tightening
+        # Update peak LTP for trailing stop calculation
+        p['peak_ltp'] = max(p.get('peak_ltp', entry), ltp)
+        peak_ltp = p['peak_ltp']
+
+        # Time-aware trailing stop tightening
         # WHY: Late-day theta decays faster (gamma risk near expiry).
-        # Same 40% stop that's fair at 10am is too loose at 2:30pm.
-        # Tighten stop progressively so afternoon trades exit quicker on failure.
+        # Trail from PEAK LTP (not entry) so profitable positions are protected,
+        # not stopped out by normal volatility on a good trade.
+        # Example: entry=47, peak=71 → stop trails 25% below peak=53.25, not 25% of 47=35.25
         minute_of_day = hm - (9 * 60 + 15)
-        if minute_of_day >= 270:      # after 1:45 PM — tighten to 25%
-            time_adjusted_stop = entry * (1 - 0.25)
-        elif minute_of_day >= 210:    # after 12:45 PM — tighten to 32%
-            time_adjusted_stop = entry * (1 - 0.32)
+        if minute_of_day >= 270:      # after 1:45 PM — trail 25% below peak
+            time_adjusted_stop = peak_ltp * (1 - 0.25)
+        elif minute_of_day >= 210:    # after 12:45 PM — trail 32% below peak
+            time_adjusted_stop = peak_ltp * (1 - 0.32)
         else:
-            time_adjusted_stop = p['stop']   # original stop (40%)
-        # Only tighten, never loosen
+            time_adjusted_stop = p['stop']   # original stop (40% of entry)
+        # Only tighten, never loosen vs original stop
         effective_stop = max(p['stop'], time_adjusted_stop)
         if ltp <= effective_stop and effective_stop > p['stop']:
             self._exit('TIME_TIGHTENED_STOP', ltp, now, ks, signal_state=signal_state)

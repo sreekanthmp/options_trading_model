@@ -102,7 +102,7 @@ class LiveFeatureDriftDetector:
                 'drifted_features': list(drifted.keys()),
                 'max_z': max(abs(z) for z in drifted.values())
             })
-            logger.warning(f"[Drift] {len(drifted)} features drifted >{threshold}σ: {list(drifted.keys())[:5]}")
+            logger.warning(f"[Drift] {len(drifted)} features drifted >{threshold} sigma: {list(drifted.keys())[:5]}")
         
         return drifted
     

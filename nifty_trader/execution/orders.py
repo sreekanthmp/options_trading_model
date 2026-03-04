@@ -716,12 +716,20 @@ def select_option(signal: dict, capital: float, now=None, tick_buffer=None,
             return None
 
     # ---- 5. Premium estimation -----------------------------------------------
+    # Prefer real API LTP from signal (fetched live from Angel One option chain).
+    # Fall back to Black-Scholes estimate only if real LTP is unavailable/zero.
+    # WHY: Formula can diverge from market price by 50+ points during CRISIS/high-IV.
     dte_mins_entry = _next_expiry_mins(now)
-    est_premium    = estimate_option_premium(
-        spot, iv_annpct, dte_mins_entry,
-        strike=float(strike), option_type=option_type
-    )
-    est_premium = max(est_premium, 30)
+    real_ltp_key   = 'ce_ltp_current' if option_type == 'CE' else 'pe_ltp_current'
+    real_ltp       = float(signal.get(real_ltp_key, 0.0))
+    if real_ltp > 1.0:
+        est_premium = real_ltp   # use real market price
+    else:
+        est_premium = estimate_option_premium(
+            spot, iv_annpct, dte_mins_entry,
+            strike=float(strike), option_type=option_type
+        )
+    est_premium = max(est_premium, 5)
 
     # ---- 5b. Bid-ask spread validation ----------------------------------------
     # If live bid/ask are available in the signal (from option chain feed), check

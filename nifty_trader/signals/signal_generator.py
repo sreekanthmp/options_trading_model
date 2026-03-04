@@ -302,12 +302,13 @@ _signal_state = SignalState()
 def generate_signal(row: pd.Series, models: dict, current_regime: int,
                     micro_regime: str = 'UNKNOWN',
                     signal_state: 'SignalState | None' = None,
-                    extra_conf_floor: float = 0.0) -> dict | None:
+                    extra_conf_floor: float = 0.0,
+                    crisis_bypass: bool = False) -> dict | None:
     """
     v3.2 EV-First Signal Generation.
 
     Signal gates (ALL must pass):
-      1.  Regime gate:          not CRISIS
+      1.  Regime gate:          not CRISIS (unless crisis_bypass=True from kill-switch)
       2.  Session gate:         9:53-15:12
       3.  Lunch filter:         12:15-13:00 blocked
       4.  Expiry filter:        no new trades after 14:30 on Thursday
@@ -327,18 +328,24 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
 
     # Gate 0: Edge Case 2 - Post-Trade Cooldown (Anti-Churn)
     # Prevent re-entering immediately after exit to avoid "Double-Dipping"
-    if ss.in_cooldown():
+    # CRISIS bypass: skip cooldown — strong trending CRISIS moves can sustain multiple entries.
+    if ss.in_cooldown() and not crisis_bypass:
+        logger.info("[Gate] BLOCKED: post-trade cooldown (15 min anti-churn)")
         return None
 
-    # Gate 1: Crisis
-    if current_regime == REGIME_CRISIS:
+    # Gate 1: Crisis — blocked unless kill-switch bypass conditions were already met
+    if current_regime == REGIME_CRISIS and not crisis_bypass:
         return None
 
     sp  = row.get('session_pct', 0)
     mod = int(row.get('minute_of_day', 0))
 
-    # Gate 2: Session window
-    if sp < 0.10 or sp > 0.92:
+    # Gate 2: Session window + late-day cutoff
+    # sp > 0.92 blocks signals after ~15:02 (375 × 0.92 = 345 min from 9:15 = 14:50+).
+    # Also block signals after minute_of_day=335 (14:50) explicitly:
+    # the 1-min bar lag means a 14:50 signal executes at 14:51, leaving 24 min.
+    # Any later and theta decay destroys the premium before the trade can develop.
+    if sp < 0.10 or sp > 0.92 or mod >= 335:
         return None
 
     # Gate 3: Lunch chop penalty (12:15-13:00)
@@ -376,7 +383,8 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
 
     # Gate 6: Temporal consistency gate (Req 5)
     # Lock new entries if 1m prediction flipped direction twice in last 2 bars.
-    if ss.temporal_locked:
+    # CRISIS bypass: skip — 1m flips are expected noise in a dominant CRISIS trend.
+    if ss.temporal_locked and not crisis_bypass:
         return None
 
     # 2️⃣ Get active features from first model (all models use same features)
@@ -460,15 +468,21 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
                 continue
             
             proba = primary_mdl.predict_proba(X)[0]
-            
+
             # Validate probability output
             if len(proba) != 2 or np.any(np.isnan(proba)) or np.any(np.isinf(proba)):
                 logger.error(f"[{h}m] Invalid model output: {proba}")
                 continue
 
+            # Preserve raw primary proba BEFORE meta-model overwrites it.
+            # Voting and direction use raw proba. Meta-model output is used
+            # only for Gate 8b (meta-labeler filter), not for vote weighting.
+            # WHY: meta-model predicts P(primary_correct) on a different scale —
+            # using it for votes corrupts direction (DOWN 87% → meta 0.48 → silenced,
+            # leaving only weak UP votes to win the aggregation).
+            proba_raw = proba.copy()
+
             if res.get('meta_model') is not None:
-                # Meta features include FSI drift indicator (from training)
-                # Handle NaN values in meta features
                 atr_pct = row.get('atr_14_pct', 0)
                 adx_val = row.get('adx_14', 0)
                 dmi_val = row.get('dmi_diff', 0)
@@ -480,13 +494,19 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
                                    0.0]])   # FSI placeholder (live: no drift avail)
                 try:
                     proba_meta = res['meta_model'].predict_proba(Xmeta)[0]
-                    proba = proba_meta
+                    # Store meta output for Gate 8b but do NOT overwrite proba_raw
+                    signals[h] = signals.get(h, {})
+                    signals[h]['meta_proba'] = float(proba_meta[1])
                 except Exception:
                     pass
 
-            pred = 1 if proba[1] > 0.5 else 0
-            conf = proba[1] if pred == 1 else proba[0]
-            signals[h] = {'pred': pred, 'conf': float(conf), 'proba': float(proba[1])}
+            # Direction and confidence from RAW primary model output only
+            pred = 1 if proba_raw[1] > 0.5 else 0
+            conf = proba_raw[1] if pred == 1 else proba_raw[0]
+            meta_proba_stored = signals.get(h, {}).get('meta_proba')
+            signals[h] = {'pred': pred, 'conf': float(conf), 'proba': float(proba_raw[1])}
+            if meta_proba_stored is not None:
+                signals[h]['meta_proba'] = meta_proba_stored
 
             # Update temporal gate with 1m prediction
             if h == 1:
@@ -496,23 +516,32 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
             # its confidence clears its own per-horizon floor (CONF_BY_HORIZON).
             # Vote = conf × ev_score × perf_weight, where ev_score = conf
             # (higher probability = higher expected EV, natural proxy).
-            h_conf_floor = CONF_BY_HORIZON.get(h, CONF_MIN)
+            # CRISIS bypass: relax per-horizon floors to CONF_MIN so all horizons
+            # get a vote. The KillSwitch already validated direction; strict floors
+            # here can exclude the very DOWN votes that triggered the bypass.
+            h_conf_floor = CONF_MIN if crisis_bypass else CONF_BY_HORIZON.get(h, CONF_MIN)
+            dir_label = 'UP' if pred == 1 else 'DN'
             if conf >= h_conf_floor:
                 w        = ss.perf_weights.get(h, HORIZON_WEIGHTS.get(h, 0.25))
                 ev_score = conf   # ev proxy: P(correct) ≈ confidence
+                vote_val = w * conf * ev_score
                 if pred == 1:
-                    weighted_up += w * conf * ev_score
+                    weighted_up += vote_val
                     avg_win_up  += conf
                 else:
-                    weighted_dn += w * conf * ev_score
+                    weighted_dn += vote_val
                     avg_win_dn  += conf
-                total_weight += w * conf * ev_score
+                total_weight += vote_val
                 n_valid      += 1
+                logger.debug(f"[Vote] h={h}m pred={dir_label} conf={conf:.3f} floor={h_conf_floor:.3f} vote={vote_val:.4f} COUNTED")
+            else:
+                logger.debug(f"[Vote] h={h}m pred={dir_label} conf={conf:.3f} floor={h_conf_floor:.3f} BELOW_FLOOR")
         except Exception as e:
             logger.error(f"[{h}m] Prediction failed: {str(e)[:100]}")
             continue  # Skip this horizon, try others
 
     if n_valid == 0 or total_weight == 0:
+        logger.info("[Gate] BLOCKED: no valid horizon votes")
         return None
 
     # Directional decision
@@ -521,17 +550,24 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
     else:
         direction = 'DOWN'; agreement = weighted_dn / (weighted_up + weighted_dn)
 
+    logger.debug(f"[Vote] w_up={weighted_up:.4f} w_dn={weighted_dn:.4f} dir={direction} agree={agreement:.3f} n={n_valid}")
+
     if agreement < 0.60:
+        logger.info(f"[Gate] BLOCKED: agreement={agreement:.2f} < 0.60")
         return None
 
     # 3️⃣ Directional Agreement Gate (CRITICAL FOR LIVE SURVIVABILITY)
     # WHY: Multi-horizon conflicts cause whipsaws. 5m and 15m must agree.
-    dir_pass, dir_reason = check_directional_agreement(signals)
-    if not dir_pass:
-        return None  # Horizons disagree or confidence gap too wide
+    # CRISIS bypass: skip — KillSwitch already validated multi-horizon agreement.
+    if not crisis_bypass:
+        dir_pass, dir_reason = check_directional_agreement(signals)
+        if not dir_pass:
+            logger.info(f"[Gate] BLOCKED: directional_agreement={dir_reason}")
+            return None
 
     avg_conf = (weighted_up + weighted_dn) / total_weight
     if avg_conf < CONF_MIN:
+        logger.info(f"[Gate] BLOCKED: avg_conf={avg_conf:.3f} < CONF_MIN={CONF_MIN}")
         return None
     
     # Edge Case 5: Tuesday FinNifty Arbitrage Filter
@@ -545,9 +581,11 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
     
     tuesday_penalty = 0.10 if dow == 1 else 0.0  # Tuesday = +10% conf boost required
 
-    # Primary horizon (5m) must agree
-    if 5 in signals and signals[5]['conf'] >= CONF_MIN:
+    # Primary horizon (5m) must agree with weighted direction
+    # CRISIS bypass: skip — 5m may show short-term noise; KillSwitch validates overall direction.
+    if not crisis_bypass and 5 in signals and signals[5]['conf'] >= CONF_MIN:
         if signals[5]['pred'] != (1 if direction == 'UP' else 0):
+            logger.info(f"[Gate] BLOCKED: 5m pred={'UP' if signals[5]['pred']==1 else 'DN'} disagrees with direction={direction}")
             return None
 
     # Gate 7: Micro-regime adaptive confidence floor (Req 3)
@@ -559,13 +597,18 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
     conf_floor += tuesday_penalty    # Tuesday requires higher confidence
     conf_floor += lunch_penalty      # Lunch hour requires higher confidence
     if avg_conf < conf_floor:
+        logger.info(f"[Gate] BLOCKED: avg_conf={avg_conf:.3f} < conf_floor={conf_floor:.3f} (micro={micro_regime})")
         return None
 
     # Gate 7b: Micro-regime must be directionally consistent in TRENDING
-    if is_trending:
+    # CRISIS bypass: skip — 1-min micro can show short bounces within a strong trend;
+    # KillSwitch already validated ML agreement >= 85% across all horizons.
+    if is_trending and not crisis_bypass:
         if direction == 'UP'   and micro_regime == 'TRENDING_DN':
+            logger.info(f"[Gate] BLOCKED: UP signal but micro=TRENDING_DN")
             return None
         if direction == 'DOWN' and micro_regime == 'TRENDING_UP':
+            logger.info(f"[Gate] BLOCKED: DOWN signal but micro=TRENDING_UP")
             return None
 
     # Gate 7c-VOL: Volatility expansion gate
@@ -579,12 +622,17 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
     atr_ratio   = float(row.get('atr_ratio', 1.0))
     bb_squeeze  = int(row.get('bb_squeeze', 0))
     vol_floor   = 0.70 if is_ranging else 0.85
-    if bb_squeeze == 1 and atr_ratio < vol_floor and micro_regime != 'BREAKOUT':
-        return None   # squeeze active + no expansion — theta will eat the trade
+    # Squeeze: apply confidence penalty instead of hard veto.
+    # A squeeze resolves with a breakout — if model confidence is very high,
+    # the breakout may already be starting. Hard-veto misses these entries.
+    squeeze_penalty = 0.05 if (bb_squeeze == 1 and atr_ratio < vol_floor and micro_regime != 'BREAKOUT') else 0.0
 
     # Staleness penalty (Req 14): decay confidence when micro-regime flips
-    stale_penalty = ss.update_staleness(micro_regime, direction)
-    adj_conf = avg_conf - stale_penalty
+    # CRISIS bypass: skip — TRENDING_UP micro in a CRISIS DOWN move is normal (dead-cat bounce).
+    # KillSwitch already validated 85%+ agreement; penalising for micro-bounce would suppress
+    # the strongest signals.
+    stale_penalty = 0.0 if crisis_bypass else ss.update_staleness(micro_regime, direction)
+    adj_conf = avg_conf - stale_penalty - squeeze_penalty
     if adj_conf < conf_floor:
         return None
 
@@ -603,9 +651,11 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
     conf_pctile = ss.conf_percentile(adj_conf, current_regime)
     # Skip percentile check if insufficient history (bootstrap period)
     if conf_pctile is not None:
-        if conf_pctile < 65:
-            return None  # Signal below 65th percentile - insufficient historical conviction
+        if conf_pctile < 55:
+            logger.info(f"[Gate] BLOCKED: conf_pctile={conf_pctile:.1f} < 55")
+            return None  # Signal below 55th percentile - insufficient historical conviction
         if NO_TRADE_PCTILE_LOW <= conf_pctile <= NO_TRADE_PCTILE_HIGH:
+            logger.info(f"[Gate] BLOCKED: conf_pctile={conf_pctile:.1f} in no-trade zone {NO_TRADE_PCTILE_LOW}-{NO_TRADE_PCTILE_HIGH}")
             return None  # ambiguous confidence zone (40-60) - absolute no-trade
 
     # Gate 8b: MetaLabeler filter (v3.2 -- Lopez de Prado meta-labeling)
@@ -613,18 +663,22 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
     # primary model is likely to be CORRECT on this specific bar's context.
     # Only trade when meta-confidence >= META_CONF_THRESH (default 0.55).
     # Uses the 5m model's meta-labeler as the canonical filter.
+    # CRISIS bypass: skip — meta-labeler trained on TRENDING/RANGING may underrate
+    # valid crisis trend signals; KillSwitch agreement already validates quality.
     meta_pass = True
     meta_conf = 1.0
-    ref_res   = models.get(5) or (next(iter(models.values())) if models else None)
-    if ref_res is not None:
-        ml = ref_res.get('meta_labeler')
-        if ml is not None and ml._fitted:
-            primary_proba = float(signals.get(5, {}).get('proba', adj_conf))
-            meta_conf = ml.predict_proba(primary_proba, row, current_regime)
-            if meta_conf < MetaLabeler.META_CONF_THRESH:
-                meta_pass = False
-    if not meta_pass:
-        return None   # meta-labeler says primary model likely wrong here
+    if not crisis_bypass:
+        ref_res   = models.get(5) or (next(iter(models.values())) if models else None)
+        if ref_res is not None:
+            ml = ref_res.get('meta_labeler')
+            if ml is not None and ml._fitted:
+                primary_proba = float(signals.get(5, {}).get('proba', adj_conf))
+                meta_conf = ml.predict_proba(primary_proba, row, current_regime)
+                if meta_conf < MetaLabeler.META_CONF_THRESH:
+                    meta_pass = False
+        if not meta_pass:
+            logger.info(f"[Gate] BLOCKED: meta_labeler conf={meta_conf:.3f} < {MetaLabeler.META_CONF_THRESH}")
+            return None   # meta-labeler says primary model likely wrong here
 
     # EV calculation for EV-first ranking (Req 12)
     # EV = P(win) x AvgWin - P(loss) x AvgLoss - Costs
@@ -640,6 +694,7 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
     iv_rank_current = float(row.get('iv_rank_approx', 50.0))
     ev_net = _ev_net(ev_raw, TOTAL_COST_PCT, mod, iv_rank=iv_rank_current)
     if ev_net <= 0:
+        logger.info(f"[Gate] BLOCKED: ev_net={ev_net:.4f} <= 0 (ev_raw={ev_raw:.4f})")
         return None   # trade is not EV-positive after realistic costs
 
     # Seasonality additive bias (Req 11): small nudge, never a veto
@@ -664,10 +719,13 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
     # 7️⃣ Entry Micro-Confirmation (FINAL EXECUTION FILTER)
     # WHY: Models can signal too early. Require price to demonstrate commitment.
     # Use SignalState's vwap_history (reset daily, no memory leak)
+    # CRISIS bypass: still run for VWAP history update, but don't block on result.
+    # 5+ consecutive red bars below VWAP already confirms direction commitment.
     micro_pass, micro_reason = check_entry_micro_confirmation(
         row, direction, ss.vwap_history
     )
-    if not micro_pass:
+    if not micro_pass and not crisis_bypass:
+        logger.info(f"[Gate] BLOCKED: micro_confirmation={micro_reason}")
         return None  # No micro-confirmation (price not committed to direction)
 
     strength = ('STRONG'   if adj_conf >= CONF_STRONG else

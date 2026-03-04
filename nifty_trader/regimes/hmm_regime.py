@@ -92,6 +92,22 @@ def intraday_regime_override(row, reg: int) -> int:
             )
             return REGIME_TRENDING
 
+    # Rule 3: HMM uncertain (pending confirmation) but intraday signals are
+    # strongly trending. When ADX > 35 and IV is not spiking, the market has
+    # clear direction — treat as TRENDING rather than blocking entirely.
+    if reg == REGIME_UNCERTAIN:
+        adx       = row.get('adx_14', 0)
+        iv_change = row.get('iv_pct_change', 0)
+        # Use tf5_ ADX when available — 5-min ADX is more stable than 1-min
+        adx5      = row.get('tf5_adx_14', adx)
+        effective_adx = max(adx, adx5)
+        if effective_adx >= 30 and iv_change < 15:
+            logger.info(
+                f"[RegimeOverride] UNCERTAIN->TRENDING: ADX_1m={adx:.1f} ADX_5m={adx5:.1f} IV_chg={iv_change:.1f}% "
+                f"— strong intraday trend overrides pending HMM confirmation"
+            )
+            return REGIME_TRENDING
+
     return reg
 
 

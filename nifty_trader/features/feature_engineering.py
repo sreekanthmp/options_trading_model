@@ -34,7 +34,7 @@ def add_1min_features_production(df: pd.DataFrame) -> pd.DataFrame:
         logger.debug("Volume column missing or constant — using tick-direction proxies only")
     EPS = 1e-9
 
-    bars_per_day = df['minute_of_day'].nunique() if 'minute_of_day' in df.columns else 375
+    bars_per_day = 375  # NIFTY session: 09:15–15:30 = 375 1-min bars, always fixed
 
     # ------------------------------------------------------------------
     # Returns  (LEAKAGE FIX: use shift(1) so ret_nm ends at bar T-1)
@@ -335,6 +335,83 @@ def add_1min_features_production(df: pd.DataFrame) -> pd.DataFrame:
     # FFT cycle (v4.0 — used as regime hint, disabled in models via FEATURE_LIVE_OK)
     # ------------------------------------------------------------------
     df['fft_cycle'] = 0.0  # placeholder; computed per-regime in regimes module
+
+    # ------------------------------------------------------------------
+    # Technical Analysis Composite Scores (v4.1 — ML/TA integration)
+    # ------------------------------------------------------------------
+    # WHY: These scores combine multiple indicators into interpretable signals
+    # that ML models can learn to trust/ignore based on regime and context.
+    # Instead of TA being display-only, models now see when TA strongly 
+    # disagrees with their predictions and can learn from those conflicts.
+    #
+    # PROBLEM SOLVED: Previously, system would predict DOWN with 95% confidence
+    # while TA showed strong BULLISH momentum (RSI 88, supertrend bull, etc.)
+    # but models couldn't see this conflict. They would fight the tape and lose.
+    #
+    # SOLUTION: Add TA composite scores as features:
+    #   - ta_momentum_score: RSI + Stochastic + Williams %R combined
+    #   - ta_trend_score: EMA crossovers + ADX + Supertrend + DMI
+    #   - ta_flow_score: Money Flow Index (institutional buying/selling)
+    #   - ta_overall_score: Weighted combination of all TA components
+    #
+    # Now models can:
+    #   1. Learn when TA patterns are reliable vs noise
+    #   2. Adjust confidence based on ML-TA agreement
+    #   3. Avoid counter-trend trades during strong momentum
+    #   4. Detect exhaustion (high TA score + overbought = reversal setup)
+    #
+    # Example patterns models will learn:
+    #   - ML=DOWN + ta_overall_score=+1.5 → Reduce confidence (fighting trend)
+    #   - ML=DOWN + ta_overall_score=+1.5 + RSI>80 → Keep confidence (exhaustion)
+    #   - ML=UP + ta_overall_score=-1.5 → Reduce confidence (weak setup)
+    #
+    # Training note: Models trained pre-v4.1 must be RETRAINED with these features.
+    # Live trading with old models will fail scaler validation and halt safely.
+    # ------------------------------------------------------------------
+    
+    def _score_feature(val, low_bad, low_ok, high_ok, high_bad):
+        """Map indicator value to [-2, +2] score."""
+        if val <= low_bad:  return -2
+        if val <= low_ok:   return -1
+        if val <= high_ok:  return 0
+        if val <= high_bad: return 1
+        return 2
+    
+    # Momentum score: RSI + Stoch + Williams
+    rsi_score   = df['rsi_14'].apply(lambda x: _score_feature(x, 20, 35, 65, 80))
+    stoch_score = df['stoch_k'].apply(lambda x: _score_feature(x, 15, 25, 75, 85))
+    willr_score = df['willr'].apply(lambda x: _score_feature(x, -95, -80, -20, -5))
+    df['ta_momentum_score'] = (rsi_score + stoch_score + willr_score) / 3
+    
+    # Trend score: EMAs + ADX + Supertrend + DMI
+    # ema9_21, ema21_50 already exist and are directional (-1/+1)
+    # supertrend is already -1/+1
+    # dmi_diff is directional
+    df['ta_trend_score'] = (
+        df['ema9_21'] * 0.25 +
+        df['ema21_50'] * 0.25 +
+        df['supertrend'] * 0.25 +
+        np.sign(df['dmi_diff']) * 0.25
+    )
+    
+    # Flow score: MFI (money flow index)
+    df['ta_flow_score'] = df['mfi_14'].apply(lambda x: _score_feature(x, 20, 35, 65, 80)) / 2
+    
+    # Overall TA score: weighted combination
+    # Combines momentum, trend, VWAP bias, OR breakout, MACD
+    vwap_bias  = df['above_vwap'].apply(lambda x: 1 if x else -1)
+    or_bias    = df['or_break_up'].apply(lambda x: 1 if x else 0) - df['or_break_dn'].apply(lambda x: 1 if x else 0)
+    macd_bias  = np.sign(macd_h)
+    
+    df['ta_overall_score'] = (
+        df['ta_momentum_score'] * 0.25 +
+        df['ta_trend_score'] * 0.35 +
+        vwap_bias * 0.20 +
+        or_bias * 0.10 +
+        macd_bias * 0.10
+    ).clip(-2, 2)  # Keep in reasonable range
+    
+    # ------------------------------------------------------------------
 
     return df
 
@@ -643,13 +720,15 @@ def get_active_feature_cols(regime: int = 1) -> list:
 
 def get_feature_cols():
     """
-    25-feature balanced set.
+    29-feature balanced set (v4.1 — ML/TA integration).
 
     GROUP A — Momentum core (9): proven top importance across all horizons.
     GROUP B — Orthogonal signals (9): exhaustion, mean-reversion, structure,
               context. Covers what pure momentum misses (overbought exits,
               squeeze breakouts, IV spikes, session noise).
     GROUP C — Market structure (7): HTF confirmation at 5-min and 15-min.
+    GROUP D — Technical Analysis Scores (4): composite TA signals that allow
+              models to learn when to trust/ignore technical patterns.
 
     Disabled (7): require data feeds not available live.
     """
@@ -685,6 +764,12 @@ def get_feature_cols():
 
         # Regime metadata (passed through but not a price feature)
         'adx_rsi_trend',  # ADX × (RSI-50)/50 interaction — trend quality
+
+        # ----- GROUP D: Technical Analysis Composite Scores (v4.1) -----
+        'ta_momentum_score',  # Combined RSI + Stoch + Williams score (-2 to +2)
+        'ta_trend_score',     # Combined EMA + ADX + Supertrend + DMI score (-1 to +1)
+        'ta_flow_score',      # MFI-based money flow score (-1 to +1)
+        'ta_overall_score',   # Overall TA bias combining all components (-2 to +2)
 
         # ----- DISABLED (unavailable live — excluded via FEATURE_LIVE_OK) -----
         'option_chain_ndi',

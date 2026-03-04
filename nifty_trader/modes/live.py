@@ -56,6 +56,9 @@ def _quick_ml_agreement(row: pd.Series, models: dict, active_features: list) -> 
 
         weighted_up = 0.0; weighted_dn = 0.0
         from ..config import HORIZON_WEIGHTS
+        # Use perf_weights from _signal_state so this mirrors generate_signal()'s
+        # weighted vote exactly.  Falls back to fixed HORIZON_WEIGHTS if not ready.
+        pw = dict(_signal_state.perf_weights) if _signal_state.perf_weights else HORIZON_WEIGHTS
         for h, res in models.items():
             mdl = res.get('final_model')
             if mdl is None or not hasattr(mdl, 'predict_proba'):
@@ -64,7 +67,7 @@ def _quick_ml_agreement(row: pd.Series, models: dict, active_features: list) -> 
             if len(proba) != 2:
                 continue
             conf = proba[1] if proba[1] > 0.5 else proba[0]
-            w = HORIZON_WEIGHTS.get(h, 0.25)
+            w = pw.get(h, HORIZON_WEIGHTS.get(h, 0.25))
             if proba[1] > 0.5:
                 weighted_up += w * conf
             else:
@@ -75,6 +78,19 @@ def _quick_ml_agreement(row: pd.Series, models: dict, active_features: list) -> 
         return max(weighted_up, weighted_dn) / total
     except Exception:
         return 0.0
+
+
+def _live_loop_cleanup(streamer, paper):
+    """Called on normal exit AND Ctrl+C to disconnect and flush paper trades."""
+    if streamer:
+        print("\nDisconnecting WebSocket...")
+        streamer.disconnect()
+    # Flush in-memory paper trades to CSV immediately so paper_report.py can
+    # read them without waiting for next-day end_of_day() reset.
+    if paper is not None and paper._trades:
+        from datetime import date as _date
+        print(f"  Saving {len(paper._trades)} trade(s) to paper_trades CSV...")
+        paper.end_of_day(_date.today().strftime('%Y-%m-%d'))
 
 
 def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
@@ -111,7 +127,7 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
 
     print(f"   Current regime: {REGIME_NAMES[current_regime]}")
     session = AngelSession()
-    ks = KillSwitch(capital)
+    ks = KillSwitch(capital, paper_mode=paper_mode)
     ks.notify_regime(current_regime)
 
     # Safety orchestrator, regime state machine, and trade logger
@@ -142,6 +158,7 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
     last_trade_day = None
     last_htf_recalc = time.time()  # Track when HTF was last fully recalculated
     htf_recalc_needed = False  # Flag to trigger HTF feature recalculation
+    last_candle_fetch = 0.0    # Throttle: only fetch 1-min candles every 5 min
     
     # Keep a manageable buffer (20k rows is ~2 months of 1-min data)
     MIN_PRELOAD_BARS = 20000
@@ -156,11 +173,17 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
         live_df5m = df5m_cold if df5m_cold is not None else None
         live_df15m = df15m_cold if df15m_cold is not None else None
     else:
-        print("  [WARN] Cold-start failed. Loading legacy buffer...")
+        # Cold-start failed (API rate-limited). Load legacy buffer for indicator
+        # warmup ONLY — mark it as stale so the first live fetch replaces it.
+        # CRITICAL: Do NOT trade on stale data. The live loop's first candle
+        # fetch will replace the stale tail with real today's data.
+        print("  [WARN] Cold-start failed. Loading legacy buffer (stale — will sync on first bar)...")
         df1m_live = load_ohlcv(DATA_1MIN, "1-min (live preload)")
         if df1m_live is None or len(df1m_live) < 2000:
             raise RuntimeError("Not enough 1-min history")
         df1m_live = df1m_live.tail(MIN_PRELOAD_BARS).reset_index(drop=True)
+        # Force immediate candle fetch on first bar to replace stale data
+        last_candle_fetch = 0.0   # already initialised to 0.0, but be explicit
 
     # Seed warmup counter so we don't wait 20 minutes when starting mid-session.
     # If the cold-start loaded today's bars, calculate how many minutes have
@@ -234,22 +257,39 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
             new5 = fetch_live_htf(session, 'FIVE_MINUTE', 300)
             new15 = fetch_live_htf(session, 'FIFTEEN_MINUTE', 200)
             
-            # Only update if we got valid data
-            if new5 is not None and len(new5) >= 50:
+            # Only update if we got enough bars for RSI(14) to be valid
+            if new5 is not None and len(new5) >= 15:
                 live_df5m = new5
                 htf_recalc_needed = True
-            if new15 is not None and len(new15) >= 30:
+            if new15 is not None and len(new15) >= 15:
                 live_df15m = new15
                 htf_recalc_needed = True
             
             last_htf_recalc = time.time()
 
-        # 3. BRIDGE THE GAP: Fetch enough candles to cover today's session (09:15 - Now)
-        # Fetching 500 candles ensures we have all of today plus the tail of Friday
-        new = fetch_live_candles(session, n=500)
-        if new is None or new.empty:
-            print(f"[{now.strftime('%H:%M:%S')}] Waiting for API data...")
-            time.sleep(10); continue
+        # 3. BRIDGE THE GAP: Fetch 1-min candles periodically (not every bar).
+        # WebSocket keeps the latest candle updated in real time (step 4b below).
+        # Historical fetch every 5 min normally; force-fetch if last bar is stale.
+        seconds_since_fetch = time.time() - last_candle_fetch
+        last_bar_age = 0
+        if len(df1m_live) > 0 and 'datetime' in df1m_live.columns:
+            last_bar_dt = df1m_live['datetime'].iloc[-1]
+            if hasattr(last_bar_dt, 'timestamp'):
+                last_bar_age = time.time() - last_bar_dt.timestamp()
+        force_fetch = last_bar_age > 90  # force if last bar > 90s old (WebSocket lagging)
+        if seconds_since_fetch >= 300 or last_candle_fetch == 0.0 or force_fetch:
+            new = fetch_live_candles(session, n=500)
+            if new is None or new.empty:
+                if last_candle_fetch == 0.0:
+                    # First fetch ever — cannot proceed without data
+                    print(f"[{now.strftime('%H:%M:%S')}] Waiting for API data...")
+                    time.sleep(10); continue
+                # Subsequent failure — keep running on existing buffer
+                logger.warning("1-min fetch failed, continuing on existing buffer")
+                new = pd.DataFrame()
+            last_candle_fetch = time.time()
+        else:
+            new = pd.DataFrame()
 
         # 4. Merge Live with History
         df1m_live = pd.concat([df1m_live, new], ignore_index=True)
@@ -276,6 +316,9 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
                     df1m_live.loc[df1m_live.index[-1], 'high'] = live_price
                 if live_price < last_low:
                     df1m_live.loc[df1m_live.index[-1], 'low'] = live_price
+                # Update datetime to now so latency monitor sees a fresh bar,
+                # not a 5-min-old timestamp from the last API fetch.
+                df1m_live.loc[df1m_live.index[-1], 'datetime'] = pd.Timestamp(now)
 
         # 5. FEATURE HYDRATION (The "Waiting" Fix)
         # We process a large enough tail to ensure indicators like RSI(14) and EMA(200) have data
@@ -295,10 +338,10 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
         # Otherwise, HTF features already exist in 'recent' via forward-fill from df1m_live (step 4a)
         if htf_recalc_needed:
             # Recalculate HTF features with fresh data every 30 minutes
-            if live_df5m is not None and not live_df5m.empty and len(live_df5m) >= 50:
+            if live_df5m is not None and not live_df5m.empty and len(live_df5m) >= 15:
                 recent = add_htf_features(recent, live_df5m, 'tf5_', [1,3,6])
-            
-            if live_df15m is not None and not live_df15m.empty and len(live_df15m) >= 30:
+
+            if live_df15m is not None and not live_df15m.empty and len(live_df15m) >= 15:
                 recent = add_htf_features(recent, live_df15m, 'tf15_', [1,4])
             
             htf_recalc_needed = False
@@ -329,6 +372,17 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
         # (hdfc_ret_1m, banknifty_spread, etc.) actually persist on the object
         # and are visible to generate_signal() and select_option() downstream.
         row = recent.iloc[-1].copy()
+
+        # -----------------------------------------------------------------------
+        # SAFETY GATE A0: Stale data guard — block signals if last bar is from
+        # a previous trading day. This prevents trading on legacy buffer data
+        # when cold-start failed and today's live candles haven't arrived yet.
+        # -----------------------------------------------------------------------
+        row_date = row.get('date', None)
+        if row_date is not None and str(row_date) != str(today_d):
+            logger.warning(f"[Safety] Stale data: last bar date={row_date}, today={today_d}. Waiting for live data...")
+            time.sleep(10)
+            continue
 
         # -----------------------------------------------------------------------
         # SAFETY GATE A: Tick warmup counter (must happen every bar, unconditionally)
@@ -535,13 +589,20 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
         if not ks_blocked and not _warmup_blocked and not regime_uncertain and drift_conf_mult > 0.0:
             # Issue 5: regime-frequency boost — raises conf floor in range-heavy periods
             regime_boost = ks.regime_conf_boost()
+            # crisis_bypass: kill-switch let us through despite CRISIS regime
+            _crisis_bypass = (not ks_blocked) and (current_regime == REGIME_CRISIS)
             signal = generate_signal(row, models, current_regime,
                                      micro_regime=micro_regime,
                                      signal_state=_signal_state,
-                                     extra_conf_floor=regime_boost)
+                                     extra_conf_floor=regime_boost,
+                                     crisis_bypass=_crisis_bypass)
 
-            # Apply feature-drift confidence penalty to the generated signal
-            if signal and drift_conf_mult < 1.0:
+            # Apply feature-drift confidence penalty to the generated signal.
+            # CRISIS bypass: skip drift penalty — CRISIS conditions are inherently OOD
+            # vs. training data (trained on TRENDING/RANGING). With 85%+ ML agreement
+            # already validated by KillSwitch, the drift penalty would only suppress
+            # legitimate crisis-trend signals.
+            if signal and drift_conf_mult < 1.0 and not _crisis_bypass:
                 original_conf = signal.get('avg_conf', 0.0)
                 signal['avg_conf'] = original_conf * drift_conf_mult
                 signal['drift_penalty'] = drift_conf_mult
@@ -609,6 +670,19 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
                         )
 
                 # Execute Paper Trade if not already in position
+                # Hard session gate at entry time: signal may have been generated
+                # on the previous bar (sp just inside window) but order executes
+                # on the next bar (sp now outside window). Re-check here.
+                # Hard entry cutoff: block new entries after 14:55 (minute_of_day >= 340).
+                # WHY: TIME_EXIT forces close at 15:15 — any entry after 14:55 leaves
+                # less than 20 min to run, guaranteeing theta decay kills the premium
+                # before the trade has time to develop.  The session gate (sp<0.92)
+                # passes the 14:59 bar but the trade executes at 15:00+ in real time.
+                _mod_now = now.hour * 60 + now.minute - (9 * 60 + 15)
+                _sp_now = float(row.get('session_pct', 0))
+                if trade_info and (_sp_now > 0.92 or _mod_now >= 340):
+                    logger.info(f"[Order] Entry blocked: session_pct={_sp_now:.3f}, minute={_mod_now} (cutoff=340)")
+                    trade_info = None
                 if trade_info and paper is not None and not paper.in_position:
                     paper.enter(signal, trade_info, now)
                     safety.register_order(signal, order_id=str(now.timestamp()))
@@ -654,12 +728,13 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
                 ltp_est = ltp_model  # Fallback: model estimate
                 pos['_using_real_ltp'] = False
 
-            # Running MAE/MFE tracking for the trade logger
+            # Running MAE/MFE tracking for the trade logger.
+            # We always BUY the option (CE for UP, PE for DOWN), so PnL is
+            # always ltp_est - entry_price regardless of trade direction.
             _ep    = pos['entry_price']
-            _dir   = pos.get('direction', 'UP')
-            _move  = (ltp_est - _ep) if _dir == 'UP' else (_ep - ltp_est)
-            _mae   = min(0.0, _move)   # negative = adverse
-            _mfe   = max(0.0, _move)   # positive = favorable
+            _move  = ltp_est - _ep   # positive = premium has risen = favorable
+            _mae   = min(0.0, _move)   # negative = adverse (premium fell)
+            _mfe   = max(0.0, _move)   # positive = favorable (premium rose)
             tl.log_bar(now, spot_now, ltp_est, _mae, _mfe)
 
             _was_in_position = paper.in_position
@@ -715,12 +790,13 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
         # Sleep until the next minute starts
         elapsed = (dt.datetime.now() - now).seconds
         sleep_s = max(1, 60 - elapsed)
-        time.sleep(sleep_s)
-    
-    # Cleanup on exit
-    if streamer:
-        print("\nDisconnecting WebSocket...")
-        streamer.disconnect()
+        try:
+            time.sleep(sleep_s)
+        except KeyboardInterrupt:
+            break   # fall through to cleanup below
+
+    # Cleanup on exit (reached on break, normal return, or Ctrl+C during sleep)
+    _live_loop_cleanup(streamer, paper)
 
     
 
@@ -733,7 +809,11 @@ def run_live(models, regime_det, capital=10000, verbose=False):
 
 
 def run_paper(models, regime_det, capital=10000, verbose=False):
-    live_loop(models, regime_det, capital=capital, paper_mode=True, verbose=verbose)
+    try:
+        live_loop(models, regime_det, capital=capital, paper_mode=True, verbose=verbose)
+    except KeyboardInterrupt:
+        print("\n  [Paper] Ctrl+C received — saving trades and exiting.")
+    # Note: end_of_day() is called inside live_loop's cleanup block on exit.
 
 
 def run_dashboard(models, regime_det, capital=10000, verbose=False):

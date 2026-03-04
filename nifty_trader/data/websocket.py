@@ -587,12 +587,16 @@ def fetch_live_htf(session: 'AngelSession', interval: str, n: int) -> pd.DataFra
     """Fetch higher-TF candles for live context with rate limiting."""
     # 2026 Edge: Rate limit to prevent 429 errors
     _api_limiter.wait_and_acquire(tokens=2)
-    
+
     obj = session.get()
     if obj is None: return None
     try:
         now = datetime.now()
-        fdt = now - timedelta(minutes=n * (5 if '5' in interval else 15) + 60)
+        # Go back N calendar days (not minutes) to avoid Angel One snapping
+        # fromdate to current day when it falls on a weekend/holiday.
+        # 5 calendar days guarantees at least 3 trading days of HTF bars.
+        fdt = now - timedelta(days=5)
+        fdt = fdt.replace(hour=9, minute=0, second=0, microsecond=0)
         r   = obj.getCandleData({
             "exchange": "NSE", "symboltoken": "99926000",
             "interval": interval,
@@ -638,7 +642,12 @@ def _fetch_with_retry(fetch_fn, *args, retries: int = 3, delay: float = 3.0, min
             print(f"    Attempt {attempt}/{retries}: got {len(result) if result is not None else 0} rows "
                   f"(need {min_rows}). Retrying in {delay}s...")
         except Exception as e:
-            print(f"    Attempt {attempt}/{retries}: exception — {e}. Retrying in {delay}s...")
+            err_str = str(e)
+            retry_delay = 20.0 if 'TooMany' in err_str or 'AB1004' in err_str else delay
+            print(f"    Attempt {attempt}/{retries}: exception — {e}. Retrying in {retry_delay}s...")
+            if attempt < retries:
+                time.sleep(retry_delay)
+            continue
         if attempt < retries:
             time.sleep(delay)
     return None

@@ -151,8 +151,9 @@ def check_entry_micro_confirmation(row: pd.Series, direction: str,
     # Update VWAP history (1 = above, 0 = below)
     current_vwap_pos = 1 if close > vwap else 0
     vwap_history.append(current_vwap_pos)
-    if len(vwap_history) > 2:
-        vwap_history.pop(0)
+    # Use popleft() for deque (pop(0) raises TypeError on deque objects)
+    while len(vwap_history) > 2:
+        vwap_history.popleft()
     
     # Rule 1: Price holds above/below VWAP for 2 consecutive bars
     if len(vwap_history) >= 2:

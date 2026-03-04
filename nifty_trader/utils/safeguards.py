@@ -65,8 +65,10 @@ def check_lpp_violation(proposed_price: float, last_5_ticks: list) -> bool:
     """
     if len(last_5_ticks) < 5:
         return False  # Not enough history, assume safe
-    
-    mean_price = sum(t['price'] for t in last_5_ticks[-5:]) / 5
+
+    # Convert to list first — deque doesn't support slice indexing
+    recent = list(last_5_ticks)[-5:]
+    mean_price = sum(t['price'] for t in recent) / 5
     deviation = abs(proposed_price - mean_price) / mean_price
     return deviation > 0.02  # 2% threshold
 

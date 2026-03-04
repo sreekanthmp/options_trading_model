@@ -26,22 +26,32 @@ def calculate_time_decay_confidence(minute_of_day: int) -> float:
         return 1.0  # Normal confidence requirements
 
 
-def calculate_dynamic_stops(entry_price: float, current_atr: float, 
-                           direction: str) -> tuple:
+def calculate_dynamic_stops(entry_price: float, current_atr: float,
+                           direction: str, delta: float = 0.5) -> tuple:
     """
     Calculate dynamic stop-loss and take-profit using ATR multiples.
-    
-    Stop: 2.5x ATR (volatility-adjusted safety net)
-    Take-Profit: 4.0x ATR (2:1 reward-risk ratio minimum)
-    
+
+    current_atr is the SPOT ATR (in Nifty index points).  Options move at
+    roughly delta × spot_move, so we scale before applying to the option premium.
+    With ATM options delta ≈ 0.50; caller can override for deeper/shallower strikes.
+
+    Stop: 2.5x option-ATR below/above entry (volatility-adjusted safety net)
+    Take-Profit: 4.0x option-ATR (2:1 reward-risk ratio minimum)
+
     Replaces static 40% stops which were too tight during volatile periods.
+    Also fixes the original bug where spot ATR was used directly against option
+    premium — for a Rs 12 option with spot ATR=20 the stop became negative.
     """
+    option_atr = current_atr * delta
+    # Clamp option_atr so stops are always meaningful (at least 1 Rs, at most 50% of entry)
+    option_atr = max(1.0, min(option_atr, entry_price * 0.50))
+
     if direction.upper() in ['UP', 'CALL', 'BULLISH']:
-        stop_loss = entry_price - (2.5 * current_atr)
-        take_profit = entry_price + (4.0 * current_atr)
+        stop_loss   = max(0.05, entry_price - (2.5 * option_atr))
+        take_profit = entry_price + (4.0 * option_atr)
     else:  # DOWN, PUT, BEARISH
-        stop_loss = entry_price + (2.5 * current_atr)
-        take_profit = entry_price - (4.0 * current_atr)
-    
+        stop_loss   = entry_price + (2.5 * option_atr)
+        take_profit = max(0.05, entry_price - (4.0 * option_atr))
+
     return stop_loss, take_profit
 

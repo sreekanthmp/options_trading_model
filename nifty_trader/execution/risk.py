@@ -17,7 +17,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from ..config import (
-    KILL_DAILY_DD_PCT, KILL_CONSEC_LOSSES, KILL_VOL_SHOCK_MULT,
+    KILL_DAILY_DD_PCT, KILL_DAILY_DD_PCT_PAPER, KILL_CONSEC_LOSSES, KILL_VOL_SHOCK_MULT,
     KILL_REGIME_FLIP_MINS, KILL_VRECOVERY_AGREE,
     TRANSITION_SHOCK_MINS, TRANSITION_CONF_BOOST,
     REGIME_CRISIS, REGIME_TRENDING, REGIME_RANGING, REGIME_NAMES,
@@ -57,8 +57,10 @@ class KillSwitch:
       - Edge Case 6: "FracDiff Warmup" - Handled by sync_historical_buffer() cold-start
     """
 
-    def __init__(self, capital: float):
+    def __init__(self, capital: float, paper_mode: bool = False):
         self.capital          = capital
+        self.paper_mode       = paper_mode
+        self._daily_dd_limit  = KILL_DAILY_DD_PCT_PAPER if paper_mode else KILL_DAILY_DD_PCT
         self.day_start_equity = capital
         self.current_equity   = capital
         self.consec_losses    = 0
@@ -119,9 +121,9 @@ class KillSwitch:
 
         # Daily loss limit — trigger auto-flatten immediately
         day_dd = (self.current_equity - self.day_start_equity) / (self.day_start_equity + 1e-9)
-        if day_dd <= -KILL_DAILY_DD_PCT and not self._day_halted:
+        if day_dd <= -self._daily_dd_limit and not self._day_halted:
             self._day_halted    = True
-            self._halt_reason   = f"Daily DD {day_dd:.1%} hit limit {-KILL_DAILY_DD_PCT:.1%}"
+            self._halt_reason   = f"Daily DD {day_dd:.1%} hit limit {-self._daily_dd_limit:.1%}"
             self.request_flatten(f"DAILY_LOSS_LIMIT: {day_dd:.1%}")
 
     def request_flatten(self, reason: str):
@@ -151,7 +153,7 @@ class KillSwitch:
         day_dd = (self.current_equity - self.day_start_equity) / (self.day_start_equity + 1e-9)
         if day_dd >= 0:
             return 1.0   # In profit — full size
-        used_pct = abs(day_dd) / (KILL_DAILY_DD_PCT + 1e-9)
+        used_pct = abs(day_dd) / (self._daily_dd_limit + 1e-9)
         if used_pct >= 1.0:
             return 0.0
         if used_pct >= DAILY_DD_WARN_PCT:
@@ -239,9 +241,9 @@ class KillSwitch:
 
         # Gate 1: daily drawdown (hard -- never bypassed)
         day_dd = (self.current_equity - self.day_start_equity) / (self.day_start_equity + 1e-9)
-        if day_dd <= -KILL_DAILY_DD_PCT:
+        if day_dd <= -self._daily_dd_limit:
             self._day_halted  = True
-            self._halt_reason = f"Daily DD {day_dd:.1%} breached limit {-KILL_DAILY_DD_PCT:.1%}"
+            self._halt_reason = f"Daily DD {day_dd:.1%} breached limit {-self._daily_dd_limit:.1%}"
 
         if self._day_halted:
             return True, self._halt_reason

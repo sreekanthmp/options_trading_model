@@ -91,7 +91,7 @@ class TokenBucket:
         while not self.acquire(tokens):
             time.sleep(0.05)
 
-_api_limiter = TokenBucket(rate=1.5, capacity=5)   # ~1.5 req/s max; prevents "Access denied"
+_api_limiter = TokenBucket(rate=0.4, capacity=3)   # ~1 req/2.5s; Angel One AB1004 safe threshold
 _training_feature_stats = {}
 
 # ---------------------------------------------------------------------------
@@ -144,7 +144,7 @@ CONF_MODERATE = 0.60
 CONF_MIN      = 0.55
 CONF_BY_HORIZON = {1: 0.52, 5: 0.60, 15: 0.65, 30: 0.68}
 CONF_FLOOR_TRENDING = 0.58
-CONF_FLOOR_RANGING  = 0.72
+CONF_FLOOR_RANGING  = 0.62
 NO_TRADE_PCTILE_LOW  = 40
 NO_TRADE_PCTILE_HIGH = 60
 
@@ -240,11 +240,12 @@ LIMIT_SPREAD_HIGH_IV_PCT= 0.006  # 0.6% extra cost — high-IV / OTM spread
 # ---------------------------------------------------------------------------
 # Kill-switch thresholds
 # ---------------------------------------------------------------------------
-KILL_DAILY_DD_PCT      = 0.02
-KILL_CONSEC_LOSSES     = 4
-KILL_VOL_SHOCK_MULT    = 2.5
-KILL_REGIME_FLIP_MINS  = 30
-KILL_VRECOVERY_AGREE   = 0.85
+KILL_DAILY_DD_PCT         = 0.02   # Live: hard 2% daily loss limit (real money)
+KILL_DAILY_DD_PCT_PAPER   = 1.00   # Paper: no effective daily limit (100%) — paper mode validates signal quality, not capital protection
+KILL_CONSEC_LOSSES        = 4
+KILL_VOL_SHOCK_MULT       = 2.5
+KILL_REGIME_FLIP_MINS     = 30
+KILL_VRECOVERY_AGREE      = 0.85
 
 # ---------------------------------------------------------------------------
 # EV-Harvesting / v3.1 constants

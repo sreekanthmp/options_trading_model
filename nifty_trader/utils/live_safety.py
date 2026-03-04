@@ -198,7 +198,7 @@ class LiveSafetyManager:
                 warn_count += 1
 
         if warn_count > 5:
-            logger.warning(f"[FeatureDrift] {warn_count} features drifting beyond {DRIFT_WARN_SIGMA}σ")
+            logger.warning(f"[FeatureDrift] {warn_count} features drifting beyond {DRIFT_WARN_SIGMA} sigma")
 
         if max_z >= DRIFT_KILL_SIGMA:
             conf_mult = 0.0   # kill signal entirely
