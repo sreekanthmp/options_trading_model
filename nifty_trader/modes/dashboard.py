@@ -114,7 +114,7 @@ def print_live_dashboard(row: pd.Series, analysis: dict,
     t_str   = f"{hhmm//60:02d}:{hhmm%60:02d}"
 
     print(f"\n{SEP}")
-    stream_tag = "  🚀 STREAMING" if streaming else ""
+    stream_tag = "  [STREAMING]" if streaming else ""
     print(f"  NIFTY LIVE ANALYSIS   {now.strftime('%Y-%m-%d %H:%M:%S')}   "
           f"IST {t_str}{stream_tag}")
     print(SEP)
@@ -291,7 +291,7 @@ def print_live_dashboard(row: pd.Series, analysis: dict,
             reason = "CRISIS regime -- gate filtered (check logs for [Gate] BLOCKED)"
         elif sp < 0.10 or sp > 0.92:
             reason = f"Outside trading session window (sp={sp:.2f})"
-        elif 180 <= mod2 < 225:
+        elif 180 <= mod2 <= 225:
             reason = "Lunch hour filter (12:15-13:00)"
         elif row.get('is_expiry', 0) == 1 and mod2 > 315:
             reason = "Expiry day -- no new trades after 14:30"
@@ -355,11 +355,11 @@ def print_live_dashboard(row: pd.Series, analysis: dict,
             if proba_up > 0.5:
                 direction = "BUY"
                 option_type = "CE"
-                signal_icon = "📈"
+                signal_icon = "^"
             else:
                 direction = "BUY"
                 option_type = "PE"
-                signal_icon = "📉"
+                signal_icon = "v"
 
             # Project spot movement
             expected_move = (proba_up - 0.5) * 2.0 * atr_now * np.sqrt(h)
@@ -386,7 +386,7 @@ def print_live_dashboard(row: pd.Series, analysis: dict,
             
             # Format recommendation
             option_display = f"{option_type} {strike_used}"
-            target_display = f"₹{proj_premium:.2f}"
+            target_display = f"Rs{proj_premium:.2f}"
             conf_display = f"{confidence*100:.1f}%"
             pnl_display = f"{'+' if pnl > 0 else ''}{pnl_pct:.1f}%"
             
@@ -412,22 +412,22 @@ def print_live_dashboard(row: pd.Series, analysis: dict,
     # ML consensus
     if ml_up_count > ml_dn_count:
         ml_direction = "BULLISH"
-        ml_symbol = "↑"
+        ml_symbol = "^"
     elif ml_dn_count > ml_up_count:
         ml_direction = "BEARISH"
-        ml_symbol = "↓"
+        ml_symbol = "v"
     else:
         ml_direction = "NEUTRAL"
         ml_symbol = "="
-    
+
     # Technical analysis bias
     tech_score = analysis['overall_score']
     if tech_score > 0.35:
         tech_direction = "BULLISH"
-        tech_symbol = "↑"
+        tech_symbol = "^"
     elif tech_score < -0.35:
         tech_direction = "BEARISH"
-        tech_symbol = "↓"
+        tech_symbol = "v"
     else:
         tech_direction = "NEUTRAL"
         tech_symbol = "="
@@ -463,7 +463,7 @@ def print_live_dashboard(row: pd.Series, analysis: dict,
             block_reason = "Pre-market session (first 10%)"
         elif sp > 0.92:
             block_reason = "Post-market session (last 8%)"
-        elif 180 <= mod < 225:
+        elif 180 <= mod <= 225:
             block_reason = "Lunch hour filter (12:15-13:00)"
         elif row.get('is_expiry', 0) == 1 and mod > 315:
             block_reason = "Expiry day late trading (after 14:30)"
@@ -562,12 +562,12 @@ def print_live_dashboard(row: pd.Series, analysis: dict,
                 pe_pnl = p.get('pe_pnl_pct', 0)
                 
                 # Color indicators for PnL
-                ce_arrow = "↑" if ce_pnl > 0 else "↓" if ce_pnl < 0 else "→"
-                pe_arrow = "↑" if pe_pnl > 0 else "↓" if pe_pnl < 0 else "→"
-                
+                ce_arrow = "^" if ce_pnl > 0 else "v" if ce_pnl < 0 else "-"
+                pe_arrow = "^" if pe_pnl > 0 else "v" if pe_pnl < 0 else "-"
+
                 print(f"  {str(h)+'min':<10} {proj_spot:>12,.2f} "
-                      f"₹{ce_net:>12,.2f} {ce_arrow} {ce_pnl:>+10.2f}% "
-                      f"₹{pe_net:>12,.2f} {pe_arrow} {pe_pnl:>+10.2f}%")
+                      f"Rs{ce_net:>12,.2f} {ce_arrow} {ce_pnl:>+10.2f}% "
+                      f"Rs{pe_net:>12,.2f} {pe_arrow} {pe_pnl:>+10.2f}%")
             else:
                 print(f"  {str(h)+'min':<10} {'N/A':>12} {'N/A':>14} {'N/A':>12} {'N/A':>14} {'N/A':>12}")
         

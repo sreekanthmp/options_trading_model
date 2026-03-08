@@ -129,6 +129,8 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
     session = AngelSession()
     ks = KillSwitch(capital, paper_mode=paper_mode)
     ks.notify_regime(current_regime)
+    _post_crisis_cooldown = 0   # bars remaining after CRISIS exit
+    _prev_regime = current_regime
 
     # Safety orchestrator, regime state machine, and trade logger
     safety        = LiveSafetyManager(ks)
@@ -552,6 +554,14 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
         # -----------------------------------------------------------------------
         current_regime = intraday_regime_override(row, current_regime)
 
+        # Post-CRISIS cooldown: block 3 bars after CRISIS clears (whipsaw zone)
+        if _prev_regime == REGIME_CRISIS and current_regime != REGIME_CRISIS:
+            _post_crisis_cooldown = 3
+            logger.info(f"CRISIS cleared -> 3-bar post-CRISIS cooldown")
+        if _post_crisis_cooldown > 0 and current_regime != REGIME_CRISIS:
+            _post_crisis_cooldown -= 1
+        _prev_regime = current_regime
+
         # -----------------------------------------------------------------------
         # Detect Micro-Regime (Breakout vs Ranging)
         # -----------------------------------------------------------------------
@@ -581,12 +591,14 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
         # Log non-ks block reasons for gate analysis
         if _warmup_blocked:
             tl.log_signal_blocked(now, warmup_reason, row)
+        elif _post_crisis_cooldown > 0:
+            tl.log_signal_blocked(now, f'POST_CRISIS_COOLDOWN: {_post_crisis_cooldown} bars', row)
         elif regime_uncertain:
             tl.log_signal_blocked(now, 'REGIME_UNCERTAIN', row)
         elif drift_conf_mult == 0.0:
             tl.log_signal_blocked(now, f'FEATURE_DRIFT_KILLED: {drift_killed[:3]}', row)
 
-        if not ks_blocked and not _warmup_blocked and not regime_uncertain and drift_conf_mult > 0.0:
+        if not ks_blocked and not _warmup_blocked and _post_crisis_cooldown == 0 and not regime_uncertain and drift_conf_mult > 0.0:
             # Issue 5: regime-frequency boost — raises conf floor in range-heavy periods
             regime_boost = ks.regime_conf_boost()
             # crisis_bypass: kill-switch let us through despite CRISIS regime
@@ -701,31 +713,37 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
         # 8. Mark-to-Market (Paper Tracking)
         if paper is not None and paper.in_position:
             spot_now = float(row.get('close', 0))
-            atr_now = float(row.get('atr_14', 1.0))
             pos = paper._position
-            bars_open = int((now - pos['entry_time']).total_seconds() / 60)
-            dte_entry = pos.get('dte_mins_entry', 750.0)
-            dte_now = max(30.0, dte_entry - bars_open)
 
-            # Use REAL option LTP from Angel One API when available.
-            # This is the single most important realism fix: in live trading,
-            # your P&L and stop triggers are based on the actual market price
-            # of the option, not a model estimate.
-            # row['atm_ce_ltp'] / row['atm_pe_ltp'] are fetched every bar above.
-            opt_type  = pos.get('option_type', 'CE')
-            real_ltp_key = 'atm_ce_ltp' if opt_type == 'CE' else 'atm_pe_ltp'
-            real_ltp  = float(row.get(real_ltp_key, 0.0))
+            # Use REAL option LTP from Angel One API — fetched at the POSITION STRIKE,
+            # not the rolling ATM. As spot drifts, the ATM changes; we must track
+            # the specific contract we own (e.g. 24600 PE, not rolling ATM PE).
+            opt_type     = pos.get('option_type', 'CE')
+            pos_strike   = int(pos.get('strike', 0))
+            real_ltp = 0.0
+            if pos_strike > 0:
+                real_ltp = fetch_option_ltp(session, pos_strike, opt_type)
 
-            # Model estimate as fallback when real LTP is unavailable (API miss)
-            ltp_model = option_pnl_estimate(pos['entry_price'], pos['spot_entry'],
-                                            spot_now, atr_now, pos['direction'],
-                                            bars_open, dte_now)
+            # BS fallback: use entry IV (stable intraday) + position strike + trading DTE.
+            # Bar-by-bar iv_proxy (ATR-derived) collapses 30-40% in quiet windows, causing
+            # BS to severely underprice the option and trigger false stop-outs.
+            # option_pnl_estimate (delta-proxy) is also unreliable for >20min holds.
+            from nifty_trader.execution.orders import estimate_option_premium as _eop, _next_expiry_mins as _nem
+            iv_ann_entry = float(pos.get('iv_annpct_entry', 0.0))
+            if iv_ann_entry <= 0:
+                iv_proxy_val = float(row.get('iv_proxy', 0.06))
+                iv_ann_entry = iv_proxy_val * (252 ** 0.5) if iv_proxy_val > 0 else 15.0
+            iv_ann_entry = max(iv_ann_entry, 12.0)   # floor at 12% — NIFTY IV never <~10%
+            dte_now_trading = _nem(now)
+            ltp_model = _eop(spot_now, iv_ann_entry, dte_now_trading,
+                             strike=float(pos_strike) if pos_strike > 0 else 0.0,
+                             option_type=opt_type)
 
             if real_ltp > 0:
                 ltp_est = real_ltp   # Live: use real market price
                 pos['_using_real_ltp'] = True
             else:
-                ltp_est = ltp_model  # Fallback: model estimate
+                ltp_est = ltp_model  # Fallback: BS at entry IV + position strike
                 pos['_using_real_ltp'] = False
 
             # Running MAE/MFE tracking for the trade logger.

@@ -138,7 +138,7 @@ class PaperTrader:
     # MARK-TO-MARKET TRACKING (called every bar while in position)
     # ------------------------------------------------------------------
     def track(self, option_ltp: float, now, ks: 'KillSwitch',
-              current_row=None, signal_state=None):
+              current_row=None, signal_state=None, rng=None):
         """
         Check live LTP against stop/target/time-exit rules.
         option_ltp: estimated current premium (from select_option logic or live feed)
@@ -158,7 +158,7 @@ class PaperTrader:
         import datetime as _dt
         hm = now.hour * 60 + now.minute
         if hm >= 15 * 60 + 15:
-            self._exit('TIME_EXIT', ltp, now, ks, signal_state=signal_state)
+            self._exit('TIME_EXIT', ltp, now, ks, signal_state=signal_state, rng=rng)
             return
 
         # Update peak LTP for trailing stop calculation
@@ -180,14 +180,17 @@ class PaperTrader:
         # Only tighten, never loosen vs original stop
         effective_stop = max(p['stop'], time_adjusted_stop)
         if ltp <= effective_stop and effective_stop > p['stop']:
-            self._exit('TIME_TIGHTENED_STOP', ltp, now, ks, signal_state=signal_state)
+            self._exit('TIME_TIGHTENED_STOP', ltp, now, ks, signal_state=signal_state, rng=rng)
             return
 
         # 2026 Edge: Anti-Wick Two-Factor Stop Logic
         # Instead of exiting on first tick that touches stop, require:
-        #   (a) Stop touched for 2 seconds (persistent breach), OR
-        #   (b) VWAP of last 10 ticks below stop (sustained breakdown)
-        # This prevents single-wick stop-outs that immediately reverse.
+        #   (a) Stop touched for 2 consecutive 1-min bars (persistent breach), OR
+        #   (b) VWAP of last 10 bars below stop (sustained breakdown)
+        #   (c) Flash crash: close below stop by 2x option-ATR
+        # Using bar count (not wall-clock seconds) makes this identical in live and replay.
+        # In live: each bar = ~60 real seconds; 2 bars = ~2 minutes confirmation.
+        # In replay: each bar processed instantly; bar count is the right unit.
         close_price = float(current_row.get('close', ltp)) if current_row is not None else ltp
         current_atr = float(current_row.get('atr_14', 0)) if current_row is not None else 0.0
         # Store current spot on position for use by _exit() decomposition
@@ -198,68 +201,77 @@ class PaperTrader:
 
         # Check if stop is touched
         stop_touched = ltp <= p['stop']
-        
+
         if stop_touched:
-            # Record touch time if first time
+            # Record touch bar count if first time
             if self._stop_touch_time is None:
-                self._stop_touch_time = time.time()
-                print(f"  ⚠️  [Anti-Wick] Stop touched at {ltp:.2f}. Waiting 2s for confirmation...")
-            
+                self._stop_touch_time = 0   # repurposed: counts bars since first touch
+                print(f"  [Anti-Wick] Stop touched at {ltp:.2f}. Waiting for bar confirmation...")
+            else:
+                self._stop_touch_time += 1  # increment bar counter each subsequent bar
+
             # Track prices after stop touch for VWAP calculation
             self._stop_touch_prices.append(ltp)
-            
-            # Calculate time since stop touch
-            time_since_touch = time.time() - self._stop_touch_time
-            
-            # Calculate VWAP of recent ticks after stop touch
+
+            bars_since_touch = self._stop_touch_time
+
+            # Calculate VWAP of recent bars after stop touch
             if len(self._stop_touch_prices) >= 3:
                 vwap_after_touch = sum(self._stop_touch_prices) / len(self._stop_touch_prices)
             else:
                 vwap_after_touch = ltp
-            
+
             # Two-factor exit conditions:
-            # 1. Time-based: Stop touched for 2+ seconds (persistent)
-            # 2. Price-based: VWAP of last 10 ticks is below stop (sustained breakdown)
+            # 1. Bar-based: Stop touched for 2+ consecutive bars (persistent)
+            # 2. Price-based: VWAP of last 10 bars is below stop (sustained breakdown)
+            #    Requires ≥3 bars of data — prevents instant confirmation on first touch
             # 3. Flash crash: Close price below stop by 2x ATR (genuine breakdown)
-            time_confirmed = time_since_touch >= 2.0
-            vwap_confirmed = vwap_after_touch <= p['stop']
-            flash_crash = (option_atr > 0) and (close_price <= p['stop'] - 2.0 * option_atr)
-            
-            if time_confirmed or vwap_confirmed or flash_crash:
+            bar_confirmed  = bars_since_touch >= 2
+            vwap_confirmed = (len(self._stop_touch_prices) >= 3) and (vwap_after_touch <= p['stop'])
+            flash_crash    = (option_atr > 0) and (close_price <= p['stop'] - 2.0 * option_atr)
+
+            if bar_confirmed or vwap_confirmed or flash_crash:
                 reason = 'TWO_FACTOR_STOP'
                 if flash_crash:
                     reason = 'FLASH_CRASH_STOP'
-                elif time_confirmed:
-                    reason = 'TIME_CONFIRMED_STOP'
+                elif bar_confirmed:
+                    reason = 'BAR_CONFIRMED_STOP'
                 elif vwap_confirmed:
                     reason = 'VWAP_CONFIRMED_STOP'
-                
-                print(f"  🛑 [Anti-Wick] Stop confirmed: {reason} (waited {time_since_touch:.1f}s, VWAP={vwap_after_touch:.2f})")
-                self._exit(reason, ltp, now, ks, signal_state=signal_state)
+
+                print(f"  [Anti-Wick] Stop confirmed: {reason} (bars={bars_since_touch}, VWAP={vwap_after_touch:.2f})")
+                self._exit(reason, ltp, now, ks, signal_state=signal_state, rng=rng)
                 return
         else:
-            # Stop not touched - reset tracker if it was previously touched (wick recovery)
+            # Stop not touched — reset tracker if it was previously touched (wick recovery)
             if self._stop_touch_time is not None:
-                print(f"  ✅ [Anti-Wick] Stop recovered! Price bounced from {min(self._stop_touch_prices):.2f} to {ltp:.2f}")
+                print(f"  [Anti-Wick] Stop recovered! Price bounced from {min(self._stop_touch_prices):.2f} to {ltp:.2f}")
                 self._stop_touch_time = None
                 self._stop_touch_prices = deque(maxlen=10)
 
         # Target hit
         if ltp >= p['target']:
-            self._exit('TARGET', ltp, now, ks, signal_state=signal_state)
+            self._exit('TARGET', ltp, now, ks, signal_state=signal_state, rng=rng)
             return
 
         # Expansion failure exit
         # WHY: Options only pay when volatility is expanding. If ATR contracts
-        # after entry, theta will eat the position even if direction is correct.
-        # Exit early rather than waiting for stop or time exit.
-        # Conditions: trade open >5 bars AND ATR ratio collapsed AND position not yet profitable
+        # after entry, theta will eat a losing position even more. BUT only exit
+        # on genuine sustained squeeze while in a loss — never kill a profitable trade.
+        # Conditions:
+        #   1. Trade open >= 15 bars (ATR5 needs time to stabilize; 5 bars was too noisy)
+        #   2. atr_ratio < 0.60 (tighter threshold — genuine squeeze, not a brief quiet bar)
+        #   3. Sustained: atr_ratio was also below 0.70 last bar (not a single-bar dip)
+        #   4. Position is in a LOSS (pnl_pct < 0) — never exit profitable trades on squeeze
         if current_row is not None:
             bars_open_now = int((now - p['entry_time']).total_seconds() / 60)
             atr_ratio_now = float(current_row.get('atr_ratio', 1.0))
             pnl_pct = (ltp / entry - 1.0)
-            if bars_open_now >= 5 and atr_ratio_now < 0.65 and pnl_pct < 0.05:
-                self._exit('EXPANSION_FAILURE', ltp, now, ks, signal_state=signal_state)
+            prev_atr_ratio = float(p.get('_prev_atr_ratio', 1.0))
+            p['_prev_atr_ratio'] = atr_ratio_now   # store for next bar
+            squeeze_sustained = (atr_ratio_now < 0.60) and (prev_atr_ratio < 0.70)
+            if bars_open_now >= 15 and squeeze_sustained and pnl_pct < 0.0:
+                self._exit('EXPANSION_FAILURE', ltp, now, ks, signal_state=signal_state, rng=rng)
                 return
 
         # Running display: show effective_delta and cumulative theta drag.
@@ -282,7 +294,8 @@ class PaperTrader:
     # ------------------------------------------------------------------
     # EXIT
     # ------------------------------------------------------------------
-    def _exit(self, reason: str, exit_price: float, now, ks: 'KillSwitch', signal_state=None):
+    def _exit(self, reason: str, exit_price: float, now, ks: 'KillSwitch', signal_state=None,
+              rng: 'np.random.Generator' = None):
         p     = self._position
         entry = p['entry_price']
         qty   = p['qty']
@@ -299,6 +312,7 @@ class PaperTrader:
             side      = 'SELL',
             is_expiry = is_expiry,
             iv_rank   = iv_rank_pos,
+            rng       = rng,
         )
         # On stop exits, if LIMIT sell doesn't fill immediately (rare), accept
         # a slightly worse price rather than missing the exit entirely — use limit_price.
@@ -431,9 +445,9 @@ class PaperTrader:
     # ------------------------------------------------------------------
     # FORCE EXIT (e.g. end of day if still open)
     # ------------------------------------------------------------------
-    def force_exit(self, exit_price: float, now, ks: 'KillSwitch', signal_state=None):
+    def force_exit(self, exit_price: float, now, ks: 'KillSwitch', signal_state=None, rng=None):
         if self._position:
-            self._exit('EOD_FORCE', exit_price, now, ks, signal_state=signal_state)
+            self._exit('EOD_FORCE', exit_price, now, ks, signal_state=signal_state, rng=rng)
 
     # ------------------------------------------------------------------
     # END-OF-DAY SUMMARY + CSV EXPORT
@@ -477,7 +491,7 @@ class PaperTrader:
         print(f"  Brokerage   : {-total_charges:+,.2f}  (STT+txn+brokerage)")
         print(f"  Spread cost : {-total_spread_cost:+,.2f}  (bid-ask, entry+exit)")
         print(f"  Theta drag  : {total_theta:+,.2f}  (time decay)")
-        print(f"  Net PnL     : {total_pnl:+,.2f}  ({ret_pct:+.2f}% of capital)  ← live equivalent")
+        print(f"  Net PnL     : {total_pnl:+,.2f}  ({ret_pct:+.2f}% of capital)  <- live equivalent")
         print(f"  Avg entry slip: {avg_entry_slip:.3f}%  |  Avg exit slip: {avg_exit_slip:.3f}%")
         print(f"  Avg win     : {(sum(t['pnl'] for t in wins)/len(wins)) if wins else 0:+.2f}")
         print(f"  Avg loss    : {(sum(t['pnl'] for t in losses)/len(losses)) if losses else 0:+.2f}")

@@ -170,22 +170,42 @@ def get_lot_size(trade_date=None) -> int:
 
 def _next_expiry_mins(now=None) -> float:
     """
-    Minutes remaining to the next NIFTY weekly expiry (Monday 15:30 IST).
+    Trading minutes remaining to the next NIFTY weekly expiry (Tuesday 15:30 IST).
 
-    NIFTY switched from Thursday to Monday weekly expiry in 2024.
+    Returns TRADING minutes (not calendar minutes): counts only market hours
+    (09:15-15:30, Mon-Fri), 375 mins/day. This is what option pricing models
+    need — theta decays only during market hours, not overnight or on weekends.
+
+    NIFTY switched from Thursday to Tuesday weekly expiry in Sep 2024.
     Uses the instrument master nearest expiry when available; falls back to
-    calendar arithmetic for Monday.
+    calendar arithmetic for Tuesday.
 
     If 'now' is None, uses the current wall-clock time.
     Returns a value clamped to [1, 375*5] (at least 1 minute, at most 5 days).
     """
     import datetime as _dt
+
     if now is None:
         now = _dt.datetime.now()
 
-    EXPIRY_HM = _dt.time(15, 30)
+    # Strip timezone if present
+    if hasattr(now, 'tzinfo') and now.tzinfo is not None:
+        now = now.replace(tzinfo=None)
 
-    # Try to use the nearest expiry from the instrument master (most accurate)
+    OPEN_HM  = _dt.time(9, 15)
+    CLOSE_HM = _dt.time(15, 30)
+
+    def _trading_mins_remaining_today(dt):
+        """Minutes left in today's session from dt (0 if outside session)."""
+        t = dt.time()
+        if t >= CLOSE_HM:
+            return 0.0
+        open_mins  = OPEN_HM.hour * 60 + OPEN_HM.minute
+        close_mins = CLOSE_HM.hour * 60 + CLOSE_HM.minute
+        cur_mins   = t.hour * 60 + t.minute
+        return max(0.0, min(close_mins, close_mins) - max(open_mins, cur_mins))
+
+    # Determine expiry date
     try:
         from ..data.external_data import _instrument_master, _master_loaded
         if _master_loaded and _instrument_master:
@@ -200,22 +220,46 @@ def _next_expiry_mins(now=None) -> float:
                         pass
             future = sorted(d for d in expiry_dates if d >= today)
             if future:
-                expiry_dt = _dt.datetime.combine(future[0], EXPIRY_HM)
-                dte_mins = (expiry_dt - now).total_seconds() / 60.0
-                return float(np.clip(dte_mins, 1.0, 375.0 * 5))
+                expiry_date = future[0]
+                # Fall through to trading-mins calculation below
+                pass
+            else:
+                expiry_date = None
+        else:
+            expiry_date = None
     except Exception:
-        pass
+        expiry_date = None
 
-    # Calendar fallback: nearest Monday at 15:30
-    MONDAY = 0
-    days_ahead = (MONDAY - now.weekday()) % 7
-    if days_ahead == 0 and now.time() >= EXPIRY_HM:
-        days_ahead = 7
-    expiry_dt = _dt.datetime.combine(
-        now.date() + _dt.timedelta(days=days_ahead), EXPIRY_HM)
+    if expiry_date is None:
+        # Calendar fallback: nearest Tuesday
+        TUESDAY = 1
+        days_ahead = (TUESDAY - now.weekday()) % 7
+        if days_ahead == 0 and now.time() >= CLOSE_HM:
+            days_ahead = 7
+        expiry_date = now.date() + _dt.timedelta(days=days_ahead)
 
-    dte_mins = (expiry_dt - now).total_seconds() / 60.0
-    return float(np.clip(dte_mins, 1.0, 375.0 * 5))
+    # Count trading minutes from now to expiry close
+    # = remaining mins today + 375 × full trading days between now and expiry
+    total_trading_mins = 0.0
+    current_date = now.date()
+
+    if current_date == expiry_date:
+        # Same day as expiry
+        total_trading_mins = _trading_mins_remaining_today(now)
+    elif current_date < expiry_date:
+        # Remaining minutes today
+        total_trading_mins += _trading_mins_remaining_today(now)
+        # Full trading days between tomorrow and expiry (Mon-Fri only)
+        d = current_date + _dt.timedelta(days=1)
+        while d < expiry_date:
+            if d.weekday() < 5:   # Mon-Fri
+                total_trading_mins += 375.0
+            d += _dt.timedelta(days=1)
+        # Full session on expiry day (09:15 to 15:30)
+        if expiry_date.weekday() < 5:
+            total_trading_mins += 375.0
+
+    return float(np.clip(total_trading_mins, 1.0, 375.0 * 5))
 
 
 def estimate_option_premium(spot: float, iv_annualised_pct: float,
@@ -223,59 +267,49 @@ def estimate_option_premium(spot: float, iv_annualised_pct: float,
                              strike: float = 0.0,
                              option_type: str = 'CE') -> float:
     """
-    Time-value estimate for a NIFTY weekly option with dynamic delta proxy.
+    Black-Scholes option pricing for NIFTY weekly options.
 
-    Model:   premium ≈ intrinsic_value + time_value
-             where:
-             - intrinsic_value = max(0, spot - strike) for CE, max(0, strike - spot) for PE
-             - time_value = delta × IV_per_min × sqrt(DTE_mins) × spot
-             - IV_per_min = iv_annualised_pct / 100 / sqrt(252 × 375)
+    Uses proper BS formula (scipy.stats.norm) which gives the correct
+    ATM coefficient (~0.40) vs the old delta-proxy formula that used
+    0.50, causing a systematic 20-25% overestimate on all option prices.
 
-    Dynamic delta (no Black-Scholes, no Greeks):
-      - Moneyness  = spot / strike  (1.0 = ATM)
-      - ATM (moneyness ≈ 1.0): delta ≈ 0.50
-      - OTM: delta falls toward 0.10
-      - ITM: delta rises toward 0.90
-      - Deep ITM: intrinsic value dominates, time value is small
-      - Expiry approach: as dte_mins → 1, premium converges to intrinsic value
-      - Clipped to [0.10, 0.90] to avoid degenerate values.
+    Parameters
+    ----------
+    spot              : current NIFTY spot price
+    iv_annualised_pct : implied volatility in % (e.g. 14.5 for 14.5%)
+    dte_mins          : minutes to expiry (clamped to [1, 375*5])
+    strike            : option strike (0 → ATM = round(spot/50)*50)
+    option_type       : 'CE' (call) or 'PE' (put)
 
-    Theta decay is implicit via sqrt(dte_mins): premium shrinks at rate
-    1/sqrt(dte_mins) as time passes.  No option chain needed.
-
-    floor at 5 (deep-OTM / final-minute minimum) or intrinsic value, whichever is higher.
+    Returns
+    -------
+    float : estimated option premium, floored at 2.0
     """
-    # Calculate intrinsic value
-    if option_type == 'CE':
-        intrinsic = max(0, spot - strike)
-    else:  # PE
-        intrinsic = max(0, strike - spot)
-    
-    iv_per_min = iv_annualised_pct / 100.0 / np.sqrt(252 * 375)
+    from scipy.stats import norm as _norm
 
-    # Dynamic delta from moneyness + time
-    if strike > 0 and spot > 0:
-        moneyness = spot / strike
-        # ATM delta = 0.50; scale by distance from ATM.
-        # The sharper factor near expiry reflects gamma acceleration.
-        dte_days    = max(dte_mins, 1.0) / 375.0
-        sharpness   = 1.0 + 3.0 * np.exp(-dte_days)    # 2..4 near expiry, 1 far out
-        
-        # For CE: moneyness > 1 (ITM), moneyness < 1 (OTM)
-        # For PE: moneyness < 1 (ITM), moneyness > 1 (OTM)
+    if strike <= 0:
+        strike = round(spot / 50) * 50
+
+    T = max(dte_mins, 1.0) / (252.0 * 375.0)   # fraction of a trading year
+    sigma = max(iv_annualised_pct, 0.1) / 100.0  # decimal annual vol
+    r = 0.065                                     # India risk-free rate (~repo rate)
+
+    # Intrinsic value at expiry (fallback for near-zero T)
+    if T < 1e-6:
         if option_type == 'CE':
-            delta_raw = 0.50 + sharpness * (moneyness - 1.0)
-        else:  # PE
-            delta_raw = 0.50 + sharpness * (1.0 - moneyness)
-        
-        delta = float(np.clip(delta_raw, 0.10, 0.90))
-    else:
-        delta = 0.50   # ATM default when strike not provided
+            return max(spot - strike, 2.0)
+        else:
+            return max(strike - spot, 2.0)
 
-    time_value = delta * iv_per_min * np.sqrt(max(dte_mins, 1.0)) * spot
-    total_premium = intrinsic + time_value
-    
-    return max(total_premium, 5.0)
+    d1 = (np.log(spot / strike) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+
+    if option_type == 'CE':
+        price = spot * _norm.cdf(d1) - strike * np.exp(-r * T) * _norm.cdf(d2)
+    else:
+        price = strike * np.exp(-r * T) * _norm.cdf(-d2) - spot * _norm.cdf(-d1)
+
+    return max(float(price), 2.0)
 
 
 def effective_delta(bars_open: int, spot_move: float,
@@ -492,9 +526,9 @@ def get_expiry_rule(is_expiry: bool, minute_of_day: int) -> dict:
     """Return the applicable expiry-day rule for the current time."""
     if not is_expiry:
         return {'allow_new': True, 'size_mult': 1.0, 'stop_tighten': 1.0}
-    if minute_of_day >= 285:   # 13:00 = 9:15 + 285 min
+    if minute_of_day >= 225:   # 13:00 = 9:15 + 225 min  → no new entries after 13:00
         return {'allow_new': False, 'size_mult': 0.0,  'stop_tighten': 0.0,  'tag': 'EXPIRY_AFTER_1300'}
-    if minute_of_day >= 135:   # 11:30 = 9:15 + 135 min
+    if minute_of_day >= 135:   # 11:30 = 9:15 + 135 min  → block 11:30–13:00
         return {'allow_new': False, 'size_mult': 0.25, 'stop_tighten': 0.50, 'tag': 'EXPIRY_1130_1300'}
     return {'allow_new': True, 'size_mult': 0.50, 'stop_tighten': 0.70, 'tag': 'EXPIRY_PRE_1130'}
 
@@ -623,7 +657,8 @@ def simulate_limit_order(mid_price: float, side: str,
 
 
 def select_option(signal: dict, capital: float, now=None, tick_buffer=None,
-                 session: 'AngelSession' = None, position_mgr: 'PositionManager' = None) -> dict:
+                 session: 'AngelSession' = None, position_mgr: 'PositionManager' = None,
+                 rng: np.random.Generator = None) -> dict:
     """Strike selection and position sizing.
 
     LIVE-SAFE redesign:
@@ -716,14 +751,18 @@ def select_option(signal: dict, capital: float, now=None, tick_buffer=None,
             return None
 
     # ---- 5. Premium estimation -----------------------------------------------
-    # Prefer real API LTP from signal (fetched live from Angel One option chain).
-    # Fall back to Black-Scholes estimate only if real LTP is unavailable/zero.
-    # WHY: Formula can diverge from market price by 50+ points during CRISIS/high-IV.
+    # In live mode, Angel One injects the real market LTP into the signal under
+    # the key 'ce_ltp_api' / 'pe_ltp_api' (set only when fetched from the live
+    # option chain — NOT the BS estimate injected by replay/signal_generator).
+    # 'ce_ltp_current' / 'pe_ltp_current' in the signal are rolling-ATM BS
+    # estimates and may be at a different strike than the one selected here.
+    # Always recompute at the exact selected strike using BS.
+    # Live mode overrides this by passing 'ce_ltp_api' / 'pe_ltp_api'.
     dte_mins_entry = _next_expiry_mins(now)
-    real_ltp_key   = 'ce_ltp_current' if option_type == 'CE' else 'pe_ltp_current'
-    real_ltp       = float(signal.get(real_ltp_key, 0.0))
-    if real_ltp > 1.0:
-        est_premium = real_ltp   # use real market price
+    api_ltp_key = 'ce_ltp_api' if option_type == 'CE' else 'pe_ltp_api'
+    api_ltp     = float(signal.get(api_ltp_key, 0.0))
+    if api_ltp > 1.0:
+        est_premium = api_ltp   # real Angel One market price — use as-is
     else:
         est_premium = estimate_option_premium(
             spot, iv_annpct, dte_mins_entry,
@@ -759,6 +798,7 @@ def select_option(signal: dict, capital: float, now=None, tick_buffer=None,
         side       = 'BUY',
         is_expiry  = is_expiry,
         iv_rank    = iv_rank,
+        rng        = rng,
     )
     if not limit_sim['filled']:
         logger.info(
@@ -793,7 +833,12 @@ def select_option(signal: dict, capital: float, now=None, tick_buffer=None,
     # Estimate entry delta from moneyness (ATM ≈ 0.5, sharpens near expiry)
     dte_days    = max(dte_mins_entry, 1.0) / 375.0
     sharpness   = 1.0 + 3.0 * np.exp(-dte_days)
-    delta_entry = float(np.clip(0.50, 0.10, 0.90))   # ATM = 0.5 baseline
+    moneyness   = spot / float(strike) if strike > 0 else 1.0
+    if direction == 'UP':   # CE: deeper ITM = higher delta
+        delta_raw = 0.50 + sharpness * (moneyness - 1.0)
+    else:                   # PE: deeper ITM (strike > spot) = higher delta
+        delta_raw = 0.50 + sharpness * (1.0 - moneyness)
+    delta_entry = float(np.clip(delta_raw, 0.10, 0.90))
 
     # Risk amount the model is willing to lose per trade
     risk_amt = capital * MAX_RISK_PCT

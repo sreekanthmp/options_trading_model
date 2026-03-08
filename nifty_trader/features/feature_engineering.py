@@ -256,7 +256,7 @@ def add_1min_features_production(df: pd.DataFrame) -> pd.DataFrame:
     df['session_pct']  = df['minute_of_day'] / float(bars_per_day)
     dt_idx = pd.to_datetime(df['date'])
     df['dow']          = dt_idx.dt.dayofweek.astype(float)
-    df['is_expiry']    = (dt_idx.dt.dayofweek == 3).astype(int)
+    df['is_expiry']    = (dt_idx.dt.dayofweek == 1).astype(int)  # 1 = Tuesday (NIFTY weekly expiry since Sep 2024)
     df['session_open'] = (df['minute_of_day'] < 30).astype(int)
     df['session_pm']   = (df['minute_of_day'] > 270).astype(int)  # after 13:45
 
@@ -760,7 +760,7 @@ def get_feature_cols():
         'or_break_dn',    # opening range breakout down flag
         'dist_pivot_lo',  # distance from prev-day low (causal pivot)
         'session_pct',    # session progress (0-1 arc)
-        'is_expiry',      # Thursday expiry flag
+        'is_expiry',      # Tuesday expiry flag (NIFTY weekly since Sep 2024)
 
         # Regime metadata (passed through but not a price feature)
         'adx_rsi_trend',  # ADX × (RSI-50)/50 interaction — trend quality

@@ -65,7 +65,7 @@ def intraday_regime_override(row, reg: int) -> int:
     minute_of_day = row.get('minute_of_day', 0)
 
     # Rule 0: Session-aware regime (first/last 30 min)
-    if minute_of_day < 30 or minute_of_day > 345:
+    if minute_of_day < 30 or minute_of_day >= 345:
         return REGIME_RANGING
 
     # Rule 1: IV spike -> CRISIS (always takes priority)
@@ -99,7 +99,7 @@ def intraday_regime_override(row, reg: int) -> int:
         adx       = row.get('adx_14', 0)
         iv_change = row.get('iv_pct_change', 0)
         # Use tf5_ ADX when available — 5-min ADX is more stable than 1-min
-        adx5      = row.get('tf5_adx_14', adx)
+        adx5      = row.get('tf5_adx', adx)
         effective_adx = max(adx, adx5)
         if effective_adx >= 30 and iv_change < 15:
             logger.info(
