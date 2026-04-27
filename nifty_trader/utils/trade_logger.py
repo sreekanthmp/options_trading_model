@@ -61,6 +61,11 @@ class TradeLogger:
     """
     One instance per live session.  Writes a rotated JSONL file per day.
     Thread-safe for single-process use (all writes are atomic line appends).
+
+    Supports multiple simultaneously open positions (e.g. trade #1 open while
+    trade #3 also opens). Each trade's state is stored in _open_trades[trade_num].
+    The single-variable approach (_open_entry_price etc.) was overwritten when a
+    second trade opened, zeroing trade #1's MAE/MFE and causing missing BAR events.
     """
 
     def __init__(self, log_dir: str = LOG_DIR):
@@ -68,12 +73,8 @@ class TradeLogger:
         today = datetime.now().strftime('%Y-%m-%d')
         self._path = os.path.join(log_dir, f'trades_{today}.jsonl')
         self._trade_num = 0
-        self._open_entry_time: str | None = None
-        self._open_entry_price: float = 0.0
-        self._open_direction: str = ''
-        self._open_contracts: int = 0
-        self._mae: float = 0.0   # max adverse excursion (pts × lots)
-        self._mfe: float = 0.0   # max favorable excursion
+        # Per-trade open state: trade_num -> {entry_time, entry_price, direction, contracts, mae, mfe}
+        self._open_trades: dict = {}
         logger.info(f"[TradeLogger] Writing to {self._path}")
 
     # -----------------------------------------------------------------------
@@ -98,14 +99,25 @@ class TradeLogger:
         regime_conf: float,
         latency_ms: float,
         active_features: list | None = None,
+        now: datetime | None = None,
+        session_regime: str = '',
+        session_regime_score: float = 0.0,
     ):
         self._trade_num += 1
-        self._open_entry_time = _now_iso()
-        self._open_entry_price = float(trade_info.get('entry_price', row.get('close', 0)))
-        self._open_direction   = signal.get('direction', '?')
-        self._open_contracts   = int(trade_info.get('contracts', 0))
-        self._mae = 0.0
-        self._mfe = 0.0
+        entry_ts    = now.isoformat(timespec='milliseconds') if now is not None else _now_iso()
+        entry_price = float(trade_info.get('entry_price', row.get('close', 0)))
+        direction   = signal.get('direction', '?')
+        contracts   = int(trade_info.get('contracts', 0))
+
+        # Store per-trade state so concurrent open positions don't overwrite each other.
+        self._open_trades[self._trade_num] = {
+            'entry_time':   entry_ts,
+            'entry_price':  entry_price,
+            'direction':    direction,
+            'contracts':    contracts,
+            'mae':          0.0,
+            'mfe':          0.0,
+        }
 
         features_snap = {}
         if active_features:
@@ -115,16 +127,16 @@ class TradeLogger:
 
         record = {
             'event':                   'ENTRY',
-            'timestamp_signal':        self._open_entry_time,
+            'timestamp_signal':        entry_ts,
             'timestamp_order_placed':  _now_iso(),
             'session_trade_number':    self._trade_num,
             'symbol':                  trade_info.get('symbol', 'NIFTY'),
             'option_type':             trade_info.get('option_type', '?'),
             'strike':                  _safe(trade_info.get('strike')),
-            'direction':               self._open_direction,
+            'direction':               direction,
             'spot_at_entry':           _safe(row.get('close')),
-            'entry_price':             _safe(self._open_entry_price),
-            'contracts':               self._open_contracts,
+            'entry_price':             _safe(entry_price),
+            'contracts':               contracts,
             'regime':                  regime,
             'regime_conf':             _safe(regime_conf),
             'model_confidence':        _safe(signal.get('avg_conf')),
@@ -137,26 +149,33 @@ class TradeLogger:
             'latency_ms':              _safe(latency_ms),
             'minute_of_day':           _safe(row.get('minute_of_day')),
             'atr_14':                  _safe(row.get('atr_14')),
+            'session_regime':          session_regime,
+            'session_regime_score':    _safe(session_regime_score),
             'features_snapshot':       features_snap,
         }
         self._write(record)
         logger.info(f"[TradeLogger] ENTRY #{self._trade_num}: "
-                    f"{self._open_direction} {self._open_contracts}x @ {self._open_entry_price:.2f}")
+                    f"{direction} {contracts}x @ {entry_price:.2f}")
 
     # -----------------------------------------------------------------------
     # Per-bar mark-to-market (while position is open)
     # -----------------------------------------------------------------------
     def log_bar(self, now: datetime, spot: float, ltp_est: float,
-                mae: float, mfe: float):
-        self._mae = mae
-        self._mfe = mfe
+                mae: float, mfe: float, trade_num: int | None = None):
+        # Update MAE/MFE for the specified trade (or the most recently opened one).
+        # Using trade_num avoids updating a different open trade's running stats.
+        _tnum = trade_num if trade_num is not None else self._trade_num
+        if _tnum in self._open_trades:
+            self._open_trades[_tnum]['mae'] = mae
+            self._open_trades[_tnum]['mfe'] = mfe
         record = {
-            'event':       'BAR',
-            'timestamp':   now.isoformat(timespec='milliseconds'),
-            'spot':        _safe(spot),
-            'ltp_est':     _safe(ltp_est),
-            'mae_running': _safe(mae),
-            'mfe_running': _safe(mfe),
+            'event':             'BAR',
+            'timestamp':         now.isoformat(timespec='milliseconds'),
+            'session_trade_number': _tnum,
+            'spot':              _safe(spot),
+            'ltp_est':           _safe(ltp_est),
+            'mae_running':       _safe(mae),
+            'mfe_running':       _safe(mfe),
         }
         self._write(record)
 
@@ -170,37 +189,44 @@ class TradeLogger:
         exit_reason: str,
         entry_price: float | None = None,
         contracts: int | None = None,
+        trade_num: int | None = None,
     ):
-        ep  = entry_price if entry_price is not None else self._open_entry_price
-        qty = contracts   if contracts   is not None else self._open_contracts
-        # Option PnL is always exit - entry: we BUY the option (CE for UP, PE for DOWN)
-        # and profit when it appreciates regardless of direction label.
+        # Identify which open trade this exit belongs to.
+        # Caller can pass trade_num explicitly; otherwise fall back to the most recently opened.
+        _tnum = trade_num if trade_num is not None else self._trade_num
+        _trade_state = self._open_trades.get(_tnum, {})
+
+        ep        = entry_price if entry_price is not None else _trade_state.get('entry_price', 0.0)
+        qty       = contracts   if contracts   is not None else _trade_state.get('contracts', 0)
+        direction = _trade_state.get('direction', self._open_trades.get(self._trade_num, {}).get('direction', '?'))
+        entry_ts  = _trade_state.get('entry_time', None)
+        # Carry running MAE/MFE from per-trade state (not a shared variable that gets overwritten)
+        mae       = _trade_state.get('mae', 0.0)
+        mfe       = _trade_state.get('mfe', 0.0)
+
         pnl_pts = exit_price - ep
         pnl_pct = pnl_pts / (ep + 1e-9) * 100
 
         record = {
             'event':                  'EXIT',
             'timestamp_exit':         now.isoformat(timespec='milliseconds'),
-            'trade_entry_timestamp':  self._open_entry_time,
-            'session_trade_number':   self._trade_num,
-            'direction':              self._open_direction,
+            'trade_entry_timestamp':  entry_ts,
+            'session_trade_number':   _tnum,
+            'direction':              direction,
             'entry_price':            _safe(ep),
             'exit_price':             _safe(exit_price),
             'exit_reason':            exit_reason,
             'contracts':              qty,
             'pnl_pts':                _safe(pnl_pts),
             'pnl_pct':                _safe(pnl_pct),
-            'max_adverse_excursion':  _safe(self._mae),
-            'max_favorable_excursion':_safe(self._mfe),
+            'max_adverse_excursion':  _safe(mae),
+            'max_favorable_excursion':_safe(mfe),
         }
         self._write(record)
-        logger.info(f"[TradeLogger] EXIT #{self._trade_num}: {exit_reason} | "
+        logger.info(f"[TradeLogger] EXIT #{_tnum}: {exit_reason} | "
                     f"PnL {pnl_pts:+.2f}pts ({pnl_pct:+.1f}%)")
-        # Reset open-trade state
-        self._open_entry_time  = None
-        self._open_entry_price = 0.0
-        self._mae = 0.0
-        self._mfe = 0.0
+        # Remove this trade's state from open dict
+        self._open_trades.pop(_tnum, None)
 
     # -----------------------------------------------------------------------
     # Blocked signal (for analysis of gate hit rates)

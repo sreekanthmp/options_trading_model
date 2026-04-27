@@ -30,15 +30,32 @@ logger = logging.getLogger(__name__)
 
 
 class _CalibratedWrapper:
-    """Isotonic-calibrated wrapper for a base classifier. Module-level so joblib can pickle it."""
-    def __init__(self, base, iso):
-        self._base = base
-        self._iso  = iso
+    """
+    Platt-scaling (sigmoid) calibrated wrapper for a base classifier.
+
+    Switched from isotonic to sigmoid calibration.
+    WHY: isotonic regression interpolates through calibration points directly —
+    with only 150-200 samples per fold it memorises the training set, collapsing
+    predictions to 0.0/1.0 at feature extremes (RSI=14, ADX=55) even when the
+    underlying model is uncertain. Platt scaling fits a 2-parameter sigmoid; it
+    cannot memorise the calibration set and produces smooth, distributed probabilities.
+
+    Confidence clip [0.45, 0.82]:
+    - Below 0.45: pure noise (model has negative conviction — don't trade)
+    - Above 0.82: post-calibration overfit artefact; real directional edge at
+      1-min resolution never exceeds ~72% (paper data confirms 100% conf = wrong)
+    """
+    def __init__(self, base, platt):
+        self._base  = base
+        self._platt = platt   # sklearn LogisticRegression fit on calibration set
         self.classes_ = base.classes_ if hasattr(base, 'classes_') else np.array([0, 1])
 
     def predict_proba(self, X):
-        raw = self._base.predict_proba(X)[:, 1]
-        cal = self._iso.predict(raw)
+        raw = self._base.predict_proba(X)[:, 1].reshape(-1, 1)
+        # Platt scaling: sigmoid applied via LogisticRegression on raw scores
+        cal = self._platt.predict_proba(raw)[:, 1]
+        # Hard clip: eliminate overconfidence artefacts and pure-noise signals
+        cal = np.clip(cal, 0.45, 0.82)
         return np.column_stack([1 - cal, cal])
 
     def predict(self, X):
@@ -205,6 +222,20 @@ def train_horizon(df: pd.DataFrame, horizon: int,
     if recent_mask.sum() > 500:
         df_train = df_h[recent_mask].reset_index(drop=True)
         print(f"  2yr recency filter: {recent_mask.sum():,}/{len(df_h):,} rows used")
+        # --- Noise filtering: remove weak / random moves ---
+        if ret_col in df_train.columns:
+            min_move = 0.0005  # 0.05% (tune later)
+
+            before = len(df_train)
+            move_mask = np.abs(df_train[ret_col]) > min_move
+            df_train = df_train[move_mask].reset_index(drop=True)
+
+            print(f"  Noise filter: {before:,} → {len(df_train):,} rows")
+            # --- Patch 5: Remove dead markets (low ADX) ---
+        if 'adx_14' in df_train.columns:
+            before = len(df_train)
+            df_train = df_train[df_train['adx_14'] > 10]
+            print(f"  ADX filter: {before:,} → {len(df_train):,}")
     else:
         df_train = df_h   # fallback to full if not enough recent data
 
@@ -227,8 +258,7 @@ def train_horizon(df: pd.DataFrame, horizon: int,
     ev_w = np.where(np.isnan(ev_w) | (ev_w <= 0), 1.0, ev_w)
     # Step 8 (v3.3): Clip EV weights to [0.2, 1.0] so no single sample
     # dominates training and outlier velocity-decay extremes are bounded.
-    ev_w = np.clip(ev_w, 0.2, 1.0)
-
+    ev_w = np.clip(ev_w, 0.1, 2.0)
     # Time-decay weights (Req 8)
     td_w = _time_decay_weights(len(y))
 
@@ -348,6 +378,10 @@ def train_horizon(df: pd.DataFrame, horizon: int,
 
     # --- MetaLabeler: predicts if primary model is correct (LdP meta-labeling) ---
     print(f"  Training meta-labeler (correctness predictor)...")
+    # Ensure required meta features exist (safe fallback)
+    for col in ['adx_14', 'atr_14_pct', 'ret_1m']:
+        if col not in df_train.columns:
+            df_train[col] = 0.0
     meta_labeler = MetaLabeler()
     meta_labeler.fit(
         X_primary     = X,
@@ -359,10 +393,12 @@ def train_horizon(df: pd.DataFrame, horizon: int,
     )
 
     # --- Calibrated final model on full recent data with combined weights ---
-    # Calibration is done with isotonic regression fitted on OOF probabilities
-    # (not on training data) to avoid data leakage inflating confidence scores.
-    # The final base model is trained on all data; isotonic calibrator maps
-    # its raw probabilities to true frequencies using the held-out OOF set.
+    # Platt scaling (sigmoid / LogisticRegression) fitted on OOF probabilities.
+    # WHY switched from isotonic: isotonic memorises the calibration set with
+    # only 150-200 samples per fold, producing saturated 0/1 outputs at feature
+    # extremes (RSI=14, ADX=55) — this caused the "100% confidence" problem in
+    # paper trading. Platt scaling (2-parameter sigmoid) cannot overfit a small
+    # calibration set and produces smooth, distributed probabilities in [0.45, 0.82].
     print(f"  Training calibrated final model...")
     final_w    = base_w * dd_w
     final_w    = final_w / final_w.mean()
@@ -372,20 +408,34 @@ def train_horizon(df: pd.DataFrame, horizon: int,
     except TypeError:
         final_base.fit(X, y)
 
-    # Calibrate using OOF probas to avoid train-set leakage
+    # Platt calibration using OOF probas (leak-free: only held-out predictions)
     try:
-        from sklearn.isotonic import IsotonicRegression
+        from sklearn.linear_model import LogisticRegression as _LR
+        from sklearn.metrics import brier_score_loss as _brier
         valid_oof_cal = ~np.isnan(oof_probas)
-        if valid_oof_cal.sum() > 200:
-            iso = IsotonicRegression(out_of_bounds='clip')
-            iso.fit(oof_probas[valid_oof_cal], y[valid_oof_cal])
-            # Wrap: replace predict_proba to apply isotonic mapping
-            final_cal = _CalibratedWrapper(final_base, iso)
-            print(f"  Calibration: isotonic on {valid_oof_cal.sum():,} OOF samples (leak-free)")
+        if valid_oof_cal.sum() > 100:
+            # Fit sigmoid on raw OOF scores → calibrated probability
+            platt = _LR(C=1.0, solver='lbfgs', max_iter=1000)
+            platt.fit(oof_probas[valid_oof_cal].reshape(-1, 1), y[valid_oof_cal])
+            final_cal = _CalibratedWrapper(final_base, platt)
+            # Brier score: perfect calibration = acc*(1-acc); ratio < 0.5 = overfit
+            raw_brier = _brier(y[valid_oof_cal], oof_probas[valid_oof_cal])
+            cal_preds  = final_cal.predict_proba(X[valid_oof_cal])[:, 1]
+            cal_brier  = _brier(y[valid_oof_cal], cal_preds)
+            acc_base   = float((y[valid_oof_cal] == (oof_probas[valid_oof_cal] > 0.5).astype(int)).mean())
+            theoretical_brier = acc_base * (1 - acc_base)
+            reliability = cal_brier / (theoretical_brier + 1e-9)
+            print(f"  Calibration (Platt): {valid_oof_cal.sum():,} OOF samples — "
+                  f"Brier={cal_brier:.4f} (raw={raw_brier:.4f}) "
+                  f"reliability={reliability:.2f} (1.0=perfect, <0.5=overfit)")
+            if reliability < 0.5:
+                print(f"  [CalibWarn] reliability={reliability:.2f} < 0.5 — model still overconfident; "
+                      f"consider more training data or stronger regularisation")
         else:
             final_cal = final_base
-            print(f"  Calibration: skipped (insufficient OOF samples)")
-    except Exception:
+            print(f"  Calibration: skipped (insufficient OOF samples: {valid_oof_cal.sum()})")
+    except Exception as _e:
+        logger.warning(f"Platt calibration failed ({_e}) — using uncalibrated model")
         final_cal = final_base
 
     # --- Mixture of Experts: regime-specific sub-models (v3.2) ---
@@ -410,15 +460,16 @@ def train_horizon(df: pd.DataFrame, horizon: int,
             rg_base.fit(Xrg, yrg, sample_weight=wrg)
         except TypeError:
             rg_base.fit(Xrg, yrg)
-        # Calibrate regime model on its OOF slice (same leak-free approach)
+        # Calibrate regime model with Platt scaling on its OOF slice (leak-free)
         try:
+            from sklearn.linear_model import LogisticRegression as _LR
             rg_oof = oof_probas[rg_mask]
             rg_y   = y[rg_mask]
             valid_rg = ~np.isnan(rg_oof)
             if valid_rg.sum() > 100:
-                iso_rg = IsotonicRegression(out_of_bounds='clip')
-                iso_rg.fit(rg_oof[valid_rg], rg_y[valid_rg])
-                rg_cal = _CalibratedWrapper(rg_base, iso_rg)
+                platt_rg = _LR(C=1.0, solver='lbfgs', max_iter=1000)
+                platt_rg.fit(rg_oof[valid_rg].reshape(-1, 1), rg_y[valid_rg])
+                rg_cal = _CalibratedWrapper(rg_base, platt_rg)
             else:
                 rg_cal = rg_base
         except Exception:
@@ -451,11 +502,12 @@ def train_horizon(df: pd.DataFrame, horizon: int,
             print(f"    {f:<30} {v:.4f}  {'#'*int(v*300)}")
 
     # --- Regime-filtered backtest ---
-    bt = backtest_folds(fold_results, y, rets, regimes, dates_all=dates)
+    bt = backtest_folds(fold_results, rets, regimes, dates_all=dates)
     print(f"  Backtest (all regimes):  {_bt_str(bt)}")
-    bt_trend = backtest_folds(fold_results, y, rets, regimes,
+    bt_trend = backtest_folds(fold_results, rets, regimes,
                                regime_filter=REGIME_TRENDING, dates_all=dates)
     print(f"  Backtest (trending only): {_bt_str(bt_trend)}")
+    backtest_breakdown(fold_results, y, rets, regimes, df_train, conf_thresh=CONF_MODERATE)
 
     return {
         'final_model':       final_cal,
@@ -481,7 +533,91 @@ def _bt_str(bt: dict) -> str:
             f"maxdd={bt['max_dd']:.1f}%  total={bt['total']:+.1f}%")
 
 
-def backtest_folds(fold_results, y_all, rets_all, regimes_all,
+def backtest_breakdown(fold_results, y_all, rets_all, regimes_all,
+                       df_train, conf_thresh=CONF_MODERATE) -> None:
+    """
+    Print win-rate breakdown by regime × ADX bucket × confidence bin.
+    Identifies which conditions produce losers so they can be gated out.
+    Called once after training — output goes to stdout only, no return value.
+    """
+    records = []
+    for r in fold_results:
+        te = r['test_idx']
+        for i, (pred, proba) in enumerate(zip(r['preds'], r['probas'])):
+            idx = te[i]
+            conf = proba if pred == 1 else (1 - proba)
+            if conf < conf_thresh:
+                continue
+            ret = float(rets_all[idx])
+            if not np.isfinite(ret):
+                continue
+            win = int((ret > 0) == (pred == 1))
+            adx = float(df_train['adx_14'].iloc[idx]) if 'adx_14' in df_train.columns else np.nan
+            mod = float(df_train['minute_of_day'].iloc[idx]) if 'minute_of_day' in df_train.columns else np.nan
+            records.append({
+                'win': win,
+                'conf': conf,
+                'regime': regimes_all[idx],
+                'adx': adx,
+                'mod': mod,
+            })
+
+    if not records:
+        return
+
+    rows = pd.DataFrame(records)
+
+    # Regime × ADX bucket
+    adx_bins   = [0, 15, 25, 100]
+    adx_labels = ['ADX<15', 'ADX15-25', 'ADX>25']
+    rows['adx_bucket'] = pd.cut(rows['adx'], bins=adx_bins, labels=adx_labels, right=False)
+
+    regime_map = {0: 'TRENDING', 1: 'RANGING', 2: 'CRISIS', -1: 'UNCERT'}
+    rows['regime_name'] = rows['regime'].map(regime_map).fillna('?')
+
+    print(f"\n  {'─'*54}")
+    print(f"  Conditional Win Rate Breakdown (conf >= {conf_thresh:.2f})")
+    print(f"  {'─'*54}")
+    print(f"  {'Condition':<28} {'n':>5}  {'WR':>6}  {'Edge':>6}")
+    print(f"  {'─'*54}")
+
+    # By regime
+    for rg_name, grp in rows.groupby('regime_name', sort=False):
+        wr = grp['win'].mean()
+        edge = wr - 0.50
+        flag = ' <<' if wr < 0.48 else ''
+        print(f"  {rg_name:<28} {len(grp):>5}  {wr:>5.1%}  {edge:>+5.1%}{flag}")
+
+    print()
+
+    # By regime × ADX
+    for (rg_name, adx_b), grp in rows.groupby(['regime_name', 'adx_bucket'], sort=False):
+        if len(grp) < 20:
+            continue
+        wr = grp['win'].mean()
+        edge = wr - 0.50
+        label = f"{rg_name} + {adx_b}"
+        flag = ' <<' if wr < 0.47 else ''
+        print(f"  {label:<28} {len(grp):>5}  {wr:>5.1%}  {edge:>+5.1%}{flag}")
+
+    print()
+
+    # By confidence bin
+    conf_bins   = [0.50, 0.55, 0.60, 0.65, 0.70, 1.01]
+    conf_labels = ['0.50-0.55','0.55-0.60','0.60-0.65','0.65-0.70','0.70+']
+    rows['conf_bin'] = pd.cut(rows['conf'], bins=conf_bins, labels=conf_labels, right=False)
+    for cb, grp in rows.groupby('conf_bin', sort=True):
+        if len(grp) < 10:
+            continue
+        wr = grp['win'].mean()
+        edge = wr - 0.50
+        flag = ' <<' if wr < 0.48 else ''
+        print(f"  conf {cb:<23} {len(grp):>5}  {wr:>5.1%}  {edge:>+5.1%}{flag}")
+
+    print(f"  {'─'*54}")
+
+
+def backtest_folds(fold_results, rets_all, regimes_all,
                    conf_thresh=CONF_MODERATE,
                    regime_filter=None,
                    dates_all=None) -> dict:
@@ -667,6 +803,7 @@ def load_all() -> tuple:
             'baseline':      meta[str(h)]['baseline'],
             'backtest':      meta[str(h)]['backtest'],
             'backtest_trending': meta[str(h)].get('backtest_trending', {}),
+            'active_features':   meta[str(h)].get('active_features', []),
         }
 
     regime_det = RegimeDetector()

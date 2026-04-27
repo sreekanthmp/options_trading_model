@@ -38,7 +38,7 @@ import time as _time
 import threading as _threading
 _cache: dict = {}
 _cache_lock = _threading.Lock()
-_CACHE_TTL_SECONDS = 90   # 90s TTL — reduces API calls to ~1/bar instead of 4/bar
+_CACHE_TTL_SECONDS = 120  # 120s TTL — at most 1 sweep per 2 min (4 calls/sweep × 2.5s gap = ~10s per sweep)
 _bg_fetch_lock = _threading.Lock()   # prevent concurrent background fetches
 _bg_thread: _threading.Thread | None = None
 
@@ -55,6 +55,7 @@ def _prefetch_all_symbols(session, symbols=('HDFCBANK', 'RELIANCE', 'BANKNIFTY',
     def _run():
         try:
             for sym in symbols:
+                _api_limiter.wait_and_acquire()   # respect AB1004 rate limit between symbols
                 _fetch_last_return_angelone(session, sym)
         finally:
             _bg_fetch_lock.release()
@@ -230,10 +231,10 @@ def _load_instrument_master() -> bool:
 
 # Cache for option LTP prices: {symbol: (timestamp, ltp)}
 _option_ltp_cache: dict = {}
-_OPTION_LTP_TTL = 55   # seconds — 1 fetch/bar max, avoids rate limit
+_OPTION_LTP_TTL = 55   # seconds — once per bar (60s bars); stop-loss path uses force_fresh=True for real-time
 
 
-def fetch_option_ltp(session, strike: int, option_type: str, expiry_date=None) -> float:
+def fetch_option_ltp(session, strike: int, option_type: str, expiry_date=None, force_fresh: bool = False) -> float:
     """
     Fetch live LTP for a NIFTY weekly option from Angel One.
 
@@ -288,8 +289,8 @@ def fetch_option_ltp(session, strike: int, option_type: str, expiry_date=None) -
 
     now_ts = _time.time()
 
-    # Return cached price if still fresh
-    if symbol in _option_ltp_cache:
+    # Return cached price if still fresh (bypass cache if force_fresh=True)
+    if not force_fresh and symbol in _option_ltp_cache:
         cached_ts, cached_ltp = _option_ltp_cache[symbol]
         if now_ts - cached_ts < _OPTION_LTP_TTL:
             return cached_ltp
@@ -345,10 +346,29 @@ def fetch_option_chain_ndi(session=None, spot: float = 0.0) -> float:
 
 def fetch_fii_dii_flow() -> dict:
     """
-    FII/DII net positions — NSE publishes this daily at ~18:30.
-    Placeholder — returns zeros.
+    FII/DII net positions from fii_dii_flow.csv (downloaded by fii_dii_downloader.py).
+    Returns the most recent available day's data.
+    NSE publishes this daily at ~18:30 — so it's previous-day data for live trading.
+    Values are in crores (Rs).
     """
-    return {'fii_net': 0.0, 'dii_net': 0.0}
+    import os
+    csv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                            'fii_dii_flow.csv')
+    try:
+        if not os.path.exists(csv_path):
+            return {'fii_net': 0.0, 'dii_net': 0.0}
+        df = pd.read_csv(csv_path, parse_dates=['date'])
+        if df.empty:
+            return {'fii_net': 0.0, 'dii_net': 0.0}
+        df = df.sort_values('date')
+        last = df.iloc[-1]
+        fii = float(last.get('fii_net_buy', 0)) if not pd.isna(last.get('fii_net_buy')) else 0.0
+        dii = float(last.get('dii_net_buy', 0)) if not pd.isna(last.get('dii_net_buy')) else 0.0
+        logger.debug(f"[FII/DII] date={last['date']}, FII={fii:.1f} Cr, DII={dii:.1f} Cr")
+        return {'fii_net': fii, 'dii_net': dii}
+    except Exception as e:
+        logger.warning(f"[FII/DII] Error reading {csv_path}: {e}")
+        return {'fii_net': 0.0, 'dii_net': 0.0}
 
 
 # calculate_time_decay_confidence and calculate_dynamic_stops live in

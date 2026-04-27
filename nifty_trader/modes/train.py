@@ -3,7 +3,12 @@ import logging
 
 from ..config import HORIZONS
 from ..data.loader import load_all_data
-from ..features.feature_engineering import add_1min_features, add_htf_features, add_daily_features
+from ..features.feature_engineering import (add_1min_features, add_htf_features, add_daily_features,
+                                             add_vix_features, add_options_chain_features,
+                                             compute_options_chain_features,
+                                             add_calendar_features, add_futures_basis_features,
+                                             add_fii_dii_features, add_global_market_features,
+                                             add_pcr_volume_features, compute_pcr_volume_features)
 from ..labels.triple_barrier import triple_barrier_labels
 from ..regimes.hmm_regime import RegimeDetector
 from ..models.trainer import train_horizon, save_all
@@ -25,6 +30,29 @@ def build_dataset():
 
     print("Adding daily features...")
     df = add_daily_features(df, df1d)
+
+    print("Adding India VIX features...")
+    df = add_vix_features(df)
+
+    print("Adding options chain features (PCR OI, max pain, IV skew)...")
+    options_df = compute_options_chain_features('nifty_options_data')
+    df = add_options_chain_features(df, options_df)
+
+    print("Adding PCR volume + ATM IV features...")
+    pcr_df = compute_pcr_volume_features('nifty_options_data')
+    df = add_pcr_volume_features(df, pcr_df=pcr_df)
+
+    print("Adding calendar features (day-of-week, expiry-week)...")
+    df = add_calendar_features(df)
+
+    print("Adding Nifty futures basis features...")
+    df = add_futures_basis_features(df)
+
+    print("Adding FII/DII flow features...")
+    df = add_fii_dii_features(df)
+
+    print("Adding global market features (S&P 500)...")
+    df = add_global_market_features(df)
 
     print("Fitting regime detector...")
     regime_det = RegimeDetector()

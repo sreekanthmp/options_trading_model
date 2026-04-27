@@ -35,7 +35,7 @@ def calculate_dynamic_stops(entry_price: float, current_atr: float,
     roughly delta × spot_move, so we scale before applying to the option premium.
     With ATM options delta ≈ 0.50; caller can override for deeper/shallower strikes.
 
-    Stop: 2.5x option-ATR below/above entry (volatility-adjusted safety net)
+    Stop: 2.5x option-ATR below/above entry, CAPPED AT 5% MAX LOSS
     Take-Profit: 4.0x option-ATR (2:1 reward-risk ratio minimum)
 
     Replaces static 40% stops which were too tight during volatile periods.
@@ -47,10 +47,13 @@ def calculate_dynamic_stops(entry_price: float, current_atr: float,
     option_atr = max(1.0, min(option_atr, entry_price * 0.50))
 
     if direction.upper() in ['UP', 'CALL', 'BULLISH']:
-        stop_loss   = max(0.05, entry_price - (2.5 * option_atr))
+        # ATR-based stop, but never more than 5% loss
+        stop_loss   = max(entry_price * 0.95, entry_price - (2.5 * option_atr))
+        stop_loss   = max(0.05, stop_loss)  # Min absolute value
         take_profit = entry_price + (4.0 * option_atr)
     else:  # DOWN, PUT, BEARISH
-        stop_loss   = entry_price + (2.5 * option_atr)
+        # ATR-based stop, but never more than 5% loss
+        stop_loss   = min(entry_price * 1.05, entry_price + (2.5 * option_atr))
         take_profit = max(0.05, entry_price - (4.0 * option_atr))
 
     return stop_loss, take_profit

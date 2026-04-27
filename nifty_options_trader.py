@@ -11,6 +11,11 @@ Usage:
     python nifty_options_trader.py --mode dashboard
     python nifty_options_trader.py --mode train_live
     python nifty_options_trader.py --mode dashboard --verbose
+    python angelone/daily_update.py --start 2026-03-09 --end 2026-03-09
+
+python fii_dii_downloader.py
+python india_vix_downloader.py  
+python sp500_downloader.py
 
 All logic lives in nifty_trader/:
     config.py               Constants, thresholds, paths

@@ -19,20 +19,24 @@ def effective_cost(row) -> float:
       - Open / close session windows: wider spreads, more slippage (+40%)
       - High IV rank (>80): elevated option premium decay risk (+30%)
       - Active regime transition: uncertainty raises execution cost (+50%)
+      - Expiry day: wider spreads, higher STT, gamma slippage (+60%)
     Multipliers are applied sequentially (not additive).
     """
     cost = TOTAL_COST_PCT
 
-
     multiplier = 1.0
     if row.get('session_open', 0) or row.get('session_pm', 0):
         multiplier *= 1.4
-    if row.get('iv_rank_approx', 0) > 80:
+    if float(row.get('iv_proxy', 0)) > 1.5:  # high realized vol → wider spreads
         multiplier *= 1.3
     if row.get('regime_transition', 0) == 1:
         multiplier *= 1.5
-    # Cap the multiplier at 2.0x
-    multiplier = min(multiplier, 2.0)
+    # Expiry day: wider bid-ask spread (2-4x normal), higher STT (0.125% vs 0.1%),
+    # and gamma slippage risk on exits — apply 60% extra cost
+    if row.get('is_expiry', 0) == 1:
+        multiplier *= 1.6
+    # Cap the multiplier at 3.0x (expiry + high-IV + transition could stack)
+    multiplier = min(multiplier, 3.0)
     cost *= multiplier
     return cost
 

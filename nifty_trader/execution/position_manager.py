@@ -8,7 +8,9 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from ..config import (STOP_LOSS_PCT, TARGET_PCT, DELTA_BASE, THETA_PTS_PER_BAR,
-                      LIMIT_BUY_BUFFER_PCT, LIMIT_SELL_BUFFER_PCT)
+                      LIMIT_BUY_BUFFER_PCT, LIMIT_SELL_BUFFER_PCT,
+                      EXPIRY_MAX_HOLD_MINS, EXPIRY_FORCE_EXIT_MOD, LOT_SIZE_NEW as LOT_SIZE,
+                      MFE_CONFIRM_BARS, MFE_CONFIRM_PTS)
 from .orders import get_lot_size, simulate_limit_order
 from ..utils.safeguards import safe_value
 from .costs import get_dynamic_theta, calculate_brokerage
@@ -113,11 +115,13 @@ class PaperTrader:
             'entry_slip_pct':     t.get('limit_slip_pct', 0.0),
             'entry_spread_cost':  t.get('limit_spread_cost', 0.0),
             'entry_fill_prob':    t.get('limit_fill_prob', 1.0),
-            'iv_rank_entry':      t.get('iv_rank', 50.0),
+            'iv_proxy_entry':     t.get('iv_proxy', 0.0),
             # Expiry flag — used by exit LIMIT simulation for wider spread penalty
             'is_expiry':          bool(signal.get('is_expiry', 0)),
             # LTP source tracking — True = real API price, False = model estimate
             '_using_real_ltp':    False,
+            # MFE tracking for zero-MFE early exit
+            'mfe_running':        0.0,
         }
 
         print(f"\n  [PAPER ENTRY]  {self._position['symbol']}  "
@@ -138,12 +142,13 @@ class PaperTrader:
     # MARK-TO-MARKET TRACKING (called every bar while in position)
     # ------------------------------------------------------------------
     def track(self, option_ltp: float, now, ks: 'KillSwitch',
-              current_row=None, signal_state=None, rng=None):
+              current_row=None, signal_state=None, rng=None, force_exit=False):
         """
         Check live LTP against stop/target/time-exit rules.
         option_ltp: estimated current premium (from select_option logic or live feed)
         current_row: optional pd.Series for the current bar (used for anti-wick stop)
         signal_state: optional SignalState object for tracking cooldown periods
+        force_exit: if True, immediately exit position (used for kill-switch emergency flatten)
         """
         if not self._position:
             return
@@ -154,33 +159,117 @@ class PaperTrader:
         ltp   = option_ltp
         pnl   = (ltp - entry) * qty
 
-        # Time-forced exit: close all positions by 15:15
+        # FORCE EXIT from kill-switch emergency flatten
+        if force_exit:
+            logger.critical(f"[PAPER] Force exit triggered - flattening position immediately")
+            self._exit('KILL_SWITCH_FLATTEN', ltp, now, ks, signal_state=signal_state, rng=rng)
+            return
+
         import datetime as _dt
         hm = now.hour * 60 + now.minute
+        minute_of_day_now = hm - (9 * 60 + 15)
+        is_expiry_pos = bool(p.get('is_expiry', False))
+
+        # Expiry-day: hard flatten at EXPIRY_FORCE_EXIT_MOD (14:40) — no exceptions.
+        # After this time, gamma is extreme and bid-ask spreads widen sharply.
+        # Waiting until 15:15 (normal day rule) risks a severe adverse move.
+        if is_expiry_pos and minute_of_day_now >= EXPIRY_FORCE_EXIT_MOD:
+            logger.info(f"[Expiry] Force-exit: mod={minute_of_day_now} >= {EXPIRY_FORCE_EXIT_MOD} (14:40)")
+            self._exit('EXPIRY_FORCE_EXIT', ltp, now, ks, signal_state=signal_state, rng=rng)
+            return
+
+        # Normal day: close all positions by 15:15
         if hm >= 15 * 60 + 15:
             self._exit('TIME_EXIT', ltp, now, ks, signal_state=signal_state, rng=rng)
             return
 
-        # Update peak LTP for trailing stop calculation
-        p['peak_ltp'] = max(p.get('peak_ltp', entry), ltp)
+        # HARD TIME EXIT
+        # Normal day: 3min exit if loss >3%; 8min exit if any loss; 30min hard cap.
+        # Expiry day: always exit at EXPIRY_MAX_HOLD_MINS.
+        entry_time = p.get('entry_time')
+        if entry_time is not None:
+            hold_mins = (now - entry_time).total_seconds() / 60
+            pnl_pct = (ltp - entry) / entry
+            if is_expiry_pos:
+                if hold_mins >= EXPIRY_MAX_HOLD_MINS:
+                    print(f"  [ExpiryExit] {hold_mins:.0f} min elapsed. PnL={pnl_pct:+.1%}. Exiting.")
+                    self._exit('MAX_HOLD_EXIT', ltp, now, ks, signal_state=signal_state, rng=rng)
+                    return
+            else:
+                # ---------------------------------------------------------------
+                # MFE CONFIRMATION GATE (early exit — the single most impactful fix)
+                # Paper data: every losing trade had MFE=0.00 at exit without exception.
+                # Every winner had MFE >= +3.07 pts. Trades that never move in our favour
+                # within the first MFE_CONFIRM_BARS bars are wrong-direction entries —
+                # exit quickly to cap loss at spread + small adverse move.
+                # Rule: if hold_mins >= MFE_CONFIRM_BARS AND MFE <= MFE_CONFIRM_PTS → exit.
+                # MFE_CONFIRM_BARS=2, MFE_CONFIRM_PTS=3.0 (from config.py — raised from 1.5).
+                # ---------------------------------------------------------------
+                gain_now = ltp - entry
+                p['mfe_running'] = max(p.get('mfe_running', 0.0), gain_now)
+                mfe = p.get('mfe_running', 0.0)
+
+                if hold_mins >= MFE_CONFIRM_BARS and mfe <= MFE_CONFIRM_PTS:
+                    print(f"  [MFEGate] {hold_mins:.0f} min, MFE={mfe:.2f} <= {MFE_CONFIRM_PTS} pts — trade never moved in our favour, exiting.")
+                    self._exit('ZERO_MFE_EXIT', ltp, now, ks, signal_state=signal_state, rng=rng)
+                    return
+
+                # Time-based exits.
+                # MFE gate above (hold >= 2 bars, MFE <= 1.5 pts) handles the fast losers.
+                # Hard cap at 25 min gives winners enough room to develop while capping theta.
+                # Paper analysis: best winners held 17-30 min; 25-min cap lets them run.
+                # If the trade has positive MFE at 25 min, it's in profit — let trail stop handle it.
+                if hold_mins >= 25 and pnl_pct < 0.0:
+                    print(f"  [25MinExit] {hold_mins:.0f} min elapsed. PnL={pnl_pct:+.1%} (loss). Exiting.")
+                    self._exit('MAX_HOLD_EXIT', ltp, now, ks, signal_state=signal_state, rng=rng)
+                    return
+                elif hold_mins >= 45:
+                    # Absolute cap: never hold more than 45 min regardless of P&L.
+                    print(f"  [45MinExit] {hold_mins:.0f} min elapsed. PnL={pnl_pct:+.1%}. Exiting.")
+                    self._exit('MAX_HOLD_EXIT', ltp, now, ks, signal_state=signal_state, rng=rng)
+                    return
+
+        # Update MFE (max favourable excursion) — tracks best profit seen
+        gain = ltp - entry
+        p['mfe_running'] = max(p.get('mfe_running', 0.0), gain)
+
+        # Update peak LTP and bar counter for trailing stop calculation
+        p['peak_ltp']   = max(p.get('peak_ltp', entry), ltp)
+        p['bars_held']  = p.get('bars_held', 0) + 1
         peak_ltp = p['peak_ltp']
 
-        # Time-aware trailing stop tightening
-        # WHY: Late-day theta decays faster (gamma risk near expiry).
-        # Trail from PEAK LTP (not entry) so profitable positions are protected,
-        # not stopped out by normal volatility on a good trade.
-        # Example: entry=47, peak=71 → stop trails 25% below peak=53.25, not 25% of 47=35.25
-        minute_of_day = hm - (9 * 60 + 15)
-        if minute_of_day >= 270:      # after 1:45 PM — trail 25% below peak
-            time_adjusted_stop = peak_ltp * (1 - 0.25)
-        elif minute_of_day >= 210:    # after 12:45 PM — trail 32% below peak
-            time_adjusted_stop = peak_ltp * (1 - 0.32)
+        # Trailing stop — once profitable, trail below peak to lock in gains.
+        # On expiry day, trail much tighter (1.5%) because gamma can reverse in seconds.
+        # On normal days, trail 3% below peak.
+        # Time-based trails activate in afternoon even if not yet profitable.
+        peak_gain_pct = (peak_ltp - entry) / entry
+
+        if is_expiry_pos:
+            # Expiry: ultra-tight trail — lock profit quickly, gamma works both ways
+            if peak_gain_pct > 0.0:
+                time_adjusted_stop = peak_ltp * (1 - 0.015)   # 1.5% trail on expiry
+            elif minute_of_day_now >= 225:                     # pin-break zone: tighten fast
+                time_adjusted_stop = peak_ltp * (1 - 0.15)
+            else:
+                time_adjusted_stop = p['stop']
         else:
-            time_adjusted_stop = p['stop']   # original stop (40% of entry)
+            # Trailing stop: activate at +5% gain, trail 6% below peak.
+            # Activation at 5%: entry=200 → +10pts moves stop to 188 (still below entry).
+            # At +10% (peak=220): trail stop = 220×0.94 = 206.8 → locks +6.8pts profit.
+            # Tighter trail catches winners earlier and prevents giving back most of the gain.
+            if peak_gain_pct >= 0.05:
+                time_adjusted_stop = peak_ltp * (1 - 0.06)
+            else:
+                time_adjusted_stop = p['stop']
+
+        # After partial exit: trail remaining half at 4% below peak (tighter than normal 6%)
+        if p.get('_partial_exited', False) and peak_gain_pct >= 0.0:
+            time_adjusted_stop = max(time_adjusted_stop, peak_ltp * (1 - 0.04))
+
         # Only tighten, never loosen vs original stop
         effective_stop = max(p['stop'], time_adjusted_stop)
         if ltp <= effective_stop and effective_stop > p['stop']:
-            self._exit('TIME_TIGHTENED_STOP', ltp, now, ks, signal_state=signal_state, rng=rng)
+            self._exit('TRAIL_STOP', ltp, now, ks, signal_state=signal_state, rng=rng)
             return
 
         # 2026 Edge: Anti-Wick Two-Factor Stop Logic
@@ -199,60 +288,75 @@ class PaperTrader:
         # Convert spot ATR to approximate option ATR using a 0.5 delta proxy
         option_atr  = current_atr * 0.5 if current_atr > 0 else 0.0
 
-        # Check if stop is touched
+        # Anti-wick two-factor stop: require stop to be breached for 2 consecutive bars
+        # before exiting. A single bar below stop is often a wick (bid-ask spread widening)
+        # that recovers the next bar.
+        #
+        # CRITICAL exception: if ltp is BELOW the stop price (a genuine breach, not a
+        # touch), exit immediately on the first bar. The 2-bar rule is for borderline
+        # touches (ltp == stop), not for cases where ltp has already passed through stop.
+        # Without this, a trade that drops from entry=205 to ltp=196 (stop=197) waits
+        # for a second bar that may never come (e.g. only 1 BAR event logged), staying
+        # open for hours and masking the real loss.
+        # Stop-loss: exit immediately on any touch (no 2-bar confirmation).
+        # The 2-bar wick filter was designed to avoid bid-ask noise exits, but with
+        # STOP_LOSS_PCT=0.10, the stop is 10% below entry — not a noise level. Any
+        # bar that closes at or below the 10% stop represents a genuine adverse move.
+        # Waiting for a second bar only deepens the loss further.
         stop_touched = ltp <= p['stop']
-
         if stop_touched:
-            # Record touch bar count if first time
-            if self._stop_touch_time is None:
-                self._stop_touch_time = 0   # repurposed: counts bars since first touch
-                print(f"  [Anti-Wick] Stop touched at {ltp:.2f}. Waiting for bar confirmation...")
-            else:
-                self._stop_touch_time += 1  # increment bar counter each subsequent bar
-
-            # Track prices after stop touch for VWAP calculation
-            self._stop_touch_prices.append(ltp)
-
-            bars_since_touch = self._stop_touch_time
-
-            # Calculate VWAP of recent bars after stop touch
-            if len(self._stop_touch_prices) >= 3:
-                vwap_after_touch = sum(self._stop_touch_prices) / len(self._stop_touch_prices)
-            else:
-                vwap_after_touch = ltp
-
-            # Two-factor exit conditions:
-            # 1. Bar-based: Stop touched for 2+ consecutive bars (persistent)
-            # 2. Price-based: VWAP of last 10 bars is below stop (sustained breakdown)
-            #    Requires ≥3 bars of data — prevents instant confirmation on first touch
-            # 3. Flash crash: Close price below stop by 2x ATR (genuine breakdown)
-            bar_confirmed  = bars_since_touch >= 2
-            vwap_confirmed = (len(self._stop_touch_prices) >= 3) and (vwap_after_touch <= p['stop'])
-            flash_crash    = (option_atr > 0) and (close_price <= p['stop'] - 2.0 * option_atr)
-
-            if bar_confirmed or vwap_confirmed or flash_crash:
-                reason = 'TWO_FACTOR_STOP'
-                if flash_crash:
-                    reason = 'FLASH_CRASH_STOP'
-                elif bar_confirmed:
-                    reason = 'BAR_CONFIRMED_STOP'
-                elif vwap_confirmed:
-                    reason = 'VWAP_CONFIRMED_STOP'
-
-                print(f"  [Anti-Wick] Stop confirmed: {reason} (bars={bars_since_touch}, VWAP={vwap_after_touch:.2f})")
-                self._exit(reason, ltp, now, ks, signal_state=signal_state, rng=rng)
-                return
-        else:
-            # Stop not touched — reset tracker if it was previously touched (wick recovery)
-            if self._stop_touch_time is not None:
-                print(f"  [Anti-Wick] Stop recovered! Price bounced from {min(self._stop_touch_prices):.2f} to {ltp:.2f}")
-                self._stop_touch_time = None
-                self._stop_touch_prices = deque(maxlen=10)
-
-        # Target hit
-        if ltp >= p['target']:
-            self._exit('TARGET', ltp, now, ks, signal_state=signal_state, rng=rng)
+            print(f"  [Stop] Hit at {ltp:.2f} (stop={p['stop']:.2f}). Exiting immediately.")
+            self._exit('STOP_LOSS', ltp, now, ks, signal_state=signal_state, rng=rng)
             return
+        # Reset wick tracker (kept for compatibility but no longer functional)
+        self._stop_touch_time = None
+
+        # Trailing take-profit: once MFE exceeds the activation threshold, trail at 50% of peak MFE.
+        # WHY: Trade #3 (Apr 23) had +3.07 MFE but no auto-exit — entire gain given back.
+        # Apr 24: entry=155.05 stop=147.30 → stop_dist=7.75. Peak MFE=7.80 (just 1x).
+        # 2x threshold required 15.50 — never reached on choppy days. Added time-based fallback:
+        #   - Standard: MFE >= 2x stop_dist (trending days, large moves)
+        #   - After 5 bars: MFE >= 1x stop_dist → tighter trail at 33% of peak (choppy days)
+        # The tighter trail on the 1x path (33% vs 50%) prevents premature exit on valid trends.
+        _stop_dist = entry - p['stop']   # how many pts below entry the stop sits
+        _bars_held  = int(p.get('bars_held', 0))
+        if _stop_dist > 0:
+            _peak_gain = peak_ltp - entry
+            if _peak_gain >= _stop_dist * 2.0:
+                # Standard trail: 2x stop_dist reached — trail at 50% of peak gain
+                _trail_tp_floor = entry + _peak_gain * 0.50
+                if ltp < _trail_tp_floor:
+                    print(f"  [TrailTP] Peak={peak_ltp:.2f} floor={_trail_tp_floor:.2f} ltp={ltp:.2f} — locking gain (2x trail).")
+                    self._exit('TRAIL_TAKE_PROFIT', ltp, now, ks, signal_state=signal_state, rng=rng)
+                    return
+            elif _bars_held >= 5 and _peak_gain >= _stop_dist * 1.0:
+                # Time-based trail: after 5 bars, 1x stop_dist is enough — trail tighter at 33%
+                # This catches choppy-day peaks where the full 2x is never reached.
+                _trail_tp_floor = entry + _peak_gain * 0.33
+                if ltp < _trail_tp_floor:
+                    print(f"  [TrailTP] Peak={peak_ltp:.2f} floor={_trail_tp_floor:.2f} ltp={ltp:.2f} — locking gain (1x time-trail).")
+                    self._exit('TRAIL_TAKE_PROFIT', ltp, now, ks, signal_state=signal_state, rng=rng)
+                    return
+
+        # Target hit: partial exit — book 50% at target, trail remaining 50%.
+        # On first target hit: reduce qty by half, move stop to entry (breakeven).
+        # Remaining half runs with a tighter 4% trail below peak until full exit.
+        if ltp >= p['target']:
+            if not p.get('_partial_exited', False) and p['contracts'] > 1:
+                # Book half the position
+                half_qty = qty // 2
+                half_pnl = (ltp - entry) * half_qty
+                p['qty']      = qty - half_qty
+                p['contracts'] = p['contracts'] // 2
+                p['stop']     = entry   # move stop to breakeven on remaining half
+                p['_partial_exited'] = True
+                print(f"  [PARTIAL TARGET] Booked {half_qty} qty at {ltp:.2f} "
+                      f"pnl={half_pnl:+.2f} — trailing remaining {p['qty']} qty from breakeven")
+                logger.info(f"[PartialExit] qty={half_qty} at {ltp:.2f} pnl={half_pnl:+.2f} remaining={p['qty']}")
+            else:
+                # Single lot or second hit — full exit
+                self._exit('TARGET', ltp, now, ks, signal_state=signal_state, rng=rng)
+                return
 
         # Expansion failure exit
         # WHY: Options only pay when volatility is expanding. If ATR contracts
@@ -269,7 +373,7 @@ class PaperTrader:
             pnl_pct = (ltp / entry - 1.0)
             prev_atr_ratio = float(p.get('_prev_atr_ratio', 1.0))
             p['_prev_atr_ratio'] = atr_ratio_now   # store for next bar
-            squeeze_sustained = (atr_ratio_now < 0.60) and (prev_atr_ratio < 0.70)
+            squeeze_sustained = (atr_ratio_now < 0.60) and (prev_atr_ratio < 0.60)  # both bars must sustain squeeze
             if bars_open_now >= 15 and squeeze_sustained and pnl_pct < 0.0:
                 self._exit('EXPANSION_FAILURE', ltp, now, ks, signal_state=signal_state, rng=rng)
                 return
@@ -304,14 +408,14 @@ class PaperTrader:
         # For stop exits: market is moving against us — fill prob is high but
         # we may get slight extra slippage as book thins. For target/time exits:
         # market is stable, fill at limit is near-certain.
-        is_expiry   = bool(p.get('is_expiry', False))   # stored at entry time
-        iv_rank_pos = float(p.get('iv_rank_entry', 50.0))
-        using_real  = bool(p.get('_using_real_ltp', False))   # was exit_price from real API?
+        is_expiry      = bool(p.get('is_expiry', False))   # stored at entry time
+        iv_proxy_pos   = float(p.get('iv_proxy_entry', 0.0))
+        using_real     = bool(p.get('_using_real_ltp', False))   # was exit_price from real API?
         exit_limit  = simulate_limit_order(
             mid_price = exit_price,
             side      = 'SELL',
             is_expiry = is_expiry,
-            iv_rank   = iv_rank_pos,
+            iv_proxy  = iv_proxy_pos,
             rng       = rng,
         )
         # On stop exits, if LIMIT sell doesn't fill immediately (rare), accept
@@ -374,6 +478,7 @@ class PaperTrader:
             'strike':       p['strike'],
             'direction':    p['direction'],
             'entry_price':  entry,
+            'stop_price':   round(p.get('stop', 0.0), 2),
             'exit_price':   round(actual_exit, 2),
             'exit_mid':     round(exit_price, 2),   # LTP before limit sim
             'qty':          qty,
@@ -453,7 +558,13 @@ class PaperTrader:
     # END-OF-DAY SUMMARY + CSV EXPORT
     # ------------------------------------------------------------------
     def end_of_day(self, trade_date):
+        # Always overwrite the CSV so stale data from previous runs never persists
+        os.makedirs('paper_trades', exist_ok=True)
+        csv_path = os.path.join('paper_trades', f"paper_{trade_date}.csv")
         if not self._trades:
+            # Write empty CSV with just a header so _read_day_pnl returns 0 correctly
+            with open(csv_path, 'w', newline='') as f:
+                f.write('symbol,pnl\n')
             print("\n  [PAPER] No trades executed today.")
             return
 
@@ -529,6 +640,7 @@ class PaperTrader:
             print(f"\n  Trades saved to {csv_path}")
         except Exception as e:
             print(f"  CSV export failed: {e}")
+
 
         # Reset for next day
         self._trades      = []

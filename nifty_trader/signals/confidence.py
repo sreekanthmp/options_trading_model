@@ -23,48 +23,42 @@ def check_directional_agreement(signals: dict) -> tuple[bool, str]:
     WHY: Multi-horizon models can conflict (5m says UP, 15m says DOWN).
          Trading on conflicting signals leads to whipsaws and losses.
          This gate ensures horizons agree before entry.
-    
-    Rules:
-        1. 5-minute horizon is PRIMARY direction
-        2. 15-minute horizon must AGREE or be NEUTRAL
-        3. 1-minute horizon is TIMING only (ignored for direction)
-        4. 30-minute horizon affects POSITION SIZE only (ignored for direction)
-        5. Reject if |conf_5m - conf_15m| > 0.25 (confidence gap too wide)
-    
+
+    Rules (v2 — aligned with direction-voting logic):
+        1. 15-minute horizon is PRIMARY direction (matches voting: 15m weight=0.45)
+        2. 30-minute horizon must AGREE with 15m
+        3. 5-minute horizon is OPTIONAL — disagreement is ignored (no veto)
+        4. 1-minute horizon is TIMING only (ignored for direction)
+
+    WHY v2: In normal mode only 15m+30m vote on direction. The old function used
+    5m as primary, which could penalize valid 15m/30m UP signals when 5m said DOWN —
+    the exact opposite of the actual direction decision.
+
     Args:
         signals: dict of {horizon: {'pred': 0/1, 'conf': float}}
-        
+
     Returns:
         (pass: bool, reason: str)
     """
-    # Extract horizon signals
-    sig_5m = signals.get(5)
     sig_15m = signals.get(15)
-    
-    if not sig_5m:
-        return False, "5m_missing"
-    
-    # 5m is primary direction
-    primary_dir = sig_5m['pred']  # 1=UP, 0=DOWN
-    primary_conf = sig_5m['conf']
-    
-    # If 15m exists, check agreement
-    if sig_15m:
-        # 15m must agree OR be neutral (conf < 0.55)
-        if sig_15m['conf'] >= 0.55:  # 15m has conviction
-            if sig_15m['pred'] != primary_dir:
-                return False, "5m_15m_conflict"
-        
-        # Confidence gap check.
-        # Threshold 0.30 (relaxed from 0.25) because in fast NIFTY breakouts
-        # the 5m model reacts 1-2 bars before the 15m model catches up.
-        # A gap of 0.25-0.30 during a genuine breakout is normal lag, not
-        # disagreement — hard-rejecting it filters the most profitable moves.
-        # Above 0.30 the disagreement is wide enough to be genuine conflict.
-        conf_gap = abs(primary_conf - sig_15m['conf'])
-        if conf_gap > 0.30:
-            return False, "confidence_gap_too_wide"
-    
+    sig_30m = signals.get(30)
+
+    # Insufficient data from the two voting horizons — cannot assess agreement.
+    # Return True (no penalty) so the vote result stands on its own merits.
+    if not sig_15m or not sig_30m:
+        return True, "insufficient_data"
+
+    primary_dir = sig_15m['pred']  # 1=UP, 0=DOWN
+
+    # Core check: 15m and 30m must agree
+    if sig_30m['pred'] != primary_dir:
+        return False, "15m_30m_conflict"
+
+    # 5m is informational only — disagreement is logged at call site but NOT a veto
+    sig_5m = signals.get(5)
+    if sig_5m and sig_5m['pred'] != primary_dir:
+        return True, "5m_disagree_ignored"
+
     return True, "directional_agreement_ok"
 
 
@@ -124,22 +118,29 @@ def compute_fft_regime_hint(fft_cycle_raw: float, smoothed_history: list) -> str
 # 7. ENTRY MICRO-CONFIRMATION (2026 LIVE SURVIVABILITY)
 # ==============================================================================
 
-def check_entry_micro_confirmation(row: pd.Series, direction: str, 
-                                    vwap_history: list) -> tuple[bool, str]:
+def check_entry_micro_confirmation(row: pd.Series, direction: str,
+                                    vwap_history,   # deque(maxlen=N) from SignalState
+                                    micro_regime: str = 'UNKNOWN',
+                                    avg_conf: float = 0.0) -> tuple[bool, str]:
     """
     WHY: Models can signal too early (before price confirms direction).
          This final filter prevents premature entries by requiring price
          to demonstrate commitment to the predicted direction.
-    
+
     Rules (need ONE of the following):
         1. Price holds above/below VWAP for 2 consecutive bars
+           Exception: RANGING regime + conf>=0.88 → 1 bar sufficient
+           (In RANGING, price oscillates around VWAP by design — 2 consecutive
+            bars above/below never happens before the move, defeating the purpose)
         2. Candle body > 0.3 x ATR(14) (strong directional candle)
-    
+
     Args:
         row: Current bar data
         direction: 'UP' or 'DOWN'
         vwap_history: Last 2 price positions relative to VWAP [older, newer]
-        
+        micro_regime: Current micro-regime string (e.g. 'RANGING', 'TRENDING_UP')
+        avg_conf: Weighted average model confidence (0-1)
+
     Returns:
         (pass: bool, reason: str)
     """
@@ -147,69 +148,116 @@ def check_entry_micro_confirmation(row: pd.Series, direction: str,
     open_price = row.get('open', 0)
     vwap = row.get('vwap_proxy', close)
     atr14 = row.get('atr_14', 0)
-    
+
     # Update VWAP history (1 = above, 0 = below)
     current_vwap_pos = 1 if close > vwap else 0
     vwap_history.append(current_vwap_pos)
-    # Use popleft() for deque (pop(0) raises TypeError on deque objects)
-    while len(vwap_history) > 2:
-        vwap_history.popleft()
-    
-    # Rule 1: Price holds above/below VWAP for 2 consecutive bars
-    if len(vwap_history) >= 2:
-        if direction == 'UP' and all(pos == 1 for pos in vwap_history):
+    # Check only the last 2 positions for consecutive confirmation
+    last_2 = list(vwap_history)[-2:]
+
+    # Rule 1: Price holds above/below VWAP for last 2 bars
+    if len(last_2) >= 2:
+        if direction == 'UP' and all(pos == 1 for pos in last_2):
             return True, "vwap_hold_above"
-        elif direction == 'DOWN' and all(pos == 0 for pos in vwap_history):
+        elif direction == 'DOWN' and all(pos == 0 for pos in last_2):
             return True, "vwap_hold_below"
-    
+
+    # Rule 1b: RANGING + very high confidence — relax to 1 bar above/below VWAP.
+    # In RANGING, price oscillates around VWAP continuously; requiring 2 consecutive
+    # bars means entry only happens after the move is half-done. At conf>=0.88 (4/4
+    # horizons strongly agreeing), allow 1-bar VWAP cross as sufficient confirmation.
+    if micro_regime == 'RANGING' and avg_conf >= 0.88:
+        if direction == 'UP' and current_vwap_pos == 1:
+            return True, "vwap_cross_ranging_highconf"
+        if direction == 'DOWN' and current_vwap_pos == 0:
+            return True, "vwap_cross_ranging_highconf"
+
+    # Rule 1c: TRENDING + very high confidence — relax to 1 bar above/below VWAP.
+    # In a strong trend (TRENDING_UP/TRENDING_DOWN), price is already far from VWAP.
+    # Waiting for 2 consecutive bars means missing the move entirely — price may
+    # never pull back to VWAP in a genuine breakout. At conf>=0.85, allow 1 bar.
+    is_trending_micro = micro_regime in ('TRENDING_UP', 'TRENDING_DOWN', 'BREAKOUT')
+    if is_trending_micro and avg_conf >= 0.85:
+        if direction == 'UP' and current_vwap_pos == 1:
+            return True, "vwap_cross_trending_highconf"
+        if direction == 'DOWN' and current_vwap_pos == 0:
+            return True, "vwap_cross_trending_highconf"
+
     # Rule 2: Strong directional candle (body > 0.3 x ATR)
     body = abs(close - open_price)
     if atr14 > 0 and body > 0.3 * atr14:
-        # Check candle direction matches signal direction
         candle_up = close > open_price
         if (direction == 'UP' and candle_up) or (direction == 'DOWN' and not candle_up):
-            return True, "strong_directional_candle"
-    
+            # Rule 2b: candle is strong BUT check microstructure isn't dead
+            # tick_imbalance and pressure_ratio must not both strongly oppose.
+            # This catches "big candle into zero momentum" entries (MFE=0 pattern).
+            tick_imb      = float(row.get('tick_imbalance', 0.0))
+            pressure_ratio = float(row.get('pressure_ratio', 1.0))
+            # For UP: need tick_imb > -0.4 (not strongly selling) OR pressure_ratio > 0.7
+            # For DOWN: need tick_imb < +0.4 (not strongly buying) OR pressure_ratio < 1.43
+            micro_ok = True
+            if direction == 'UP' and tick_imb < -0.4 and pressure_ratio < 0.7:
+                micro_ok = False
+            elif direction == 'DOWN' and tick_imb > 0.4 and pressure_ratio > 1.43:
+                micro_ok = False
+            if micro_ok:
+                return True, "strong_directional_candle"
+
+    # Rule 3: Pattern structure confirmation (v4.2)
+    # struct_score > 0 = HH/HL (bullish), < 0 = LH/LL (bearish).
+    # If structure strongly aligns with direction AND price is on correct
+    # side of VWAP (even for 1 bar), that is sufficient confirmation.
+    # This catches setups where VWAP history is too short but structure is clear.
+    struct_score = float(row.get('struct_score', 0.0))
+    orb_dist     = float(row.get('orb_dist', 0.0))
+    struct_aligned = (direction == 'UP'   and struct_score > 0.4) or \
+                     (direction == 'DOWN' and struct_score < -0.4)
+    # ORB also counts as structure confirmation if price broke out the right way
+    orb_aligned    = (direction == 'UP'   and orb_dist > 0.3) or \
+                     (direction == 'DOWN' and orb_dist < -0.3)
+    if (struct_aligned or orb_aligned) and avg_conf >= 0.80:
+        if direction == 'UP' and current_vwap_pos == 1:
+            return True, "structure_aligned_vwap"
+        if direction == 'DOWN' and current_vwap_pos == 0:
+            return True, "structure_aligned_vwap"
+
     return False, "no_micro_confirmation"
 
 
-def _ev_net(ev_predicted: float, costs: float, minute_of_day: int, iv_rank: float = 50.0) -> float:
+def _ev_net(ev_predicted: float, costs: float, minute_of_day: int, iv_rank: float = 50.0, iv_proxy: float = 0.0) -> float:
     """
     EV_net = EV_predicted - (Costs x SafetyFactor x SpreadPenalty) (Req 7).
-    
-    Edge Case 5 Mitigation: Low Liquidity/High Spread ("Impact Cost" Case)
-    When IV rank >90, bid-ask spreads on NIFTY options widen to 5-10% of premium.
-    Even correct direction predictions lose money to execution slippage.
-    
+
+    SpreadPenalty uses iv_proxy (absolute annualised vol %) instead of iv_rank
+    percentile — iv_rank breaks after crash periods (calm days rank at 5th
+    percentile for months). iv_proxy is always meaningful.
+
     SafetyFactor:
       - 1.8x during open (09:15-09:45) and close (15:00-15:30) sessions
       - 1.0x during normal trading hours
-    
-    SpreadPenalty:
-      - 1.0x when IV rank < 70 (normal spreads)
-      - 1.5x when IV rank 70-85 (elevated spreads)
-      - 2.0x when IV rank 85-90 (wide spreads)
-      - 3.0x when IV rank > 90 (extreme spreads - likely no trade)
-    
-    This triple-penalty (base cost x safety x spread) ensures EV_net only
-    passes when the edge is large enough to overcome real-world friction.
+
+    SpreadPenalty based on iv_proxy (annualised %):
+      - iv_proxy > 2.0% (crisis/extreme): 1.8x — very wide spreads
+      - iv_proxy > 1.5% (high vol):       1.5x — elevated spreads
+      - iv_proxy > 1.0% (above normal):   1.2x — slightly wide
+      - iv_proxy <= 1.0% (normal):        1.0x — normal spreads
     """
     # Time-based safety factor (open/close volatility)
     if minute_of_day <= 30 or minute_of_day >= 345:
         sf = EV_SAFETY_ELEVATED
     else:
         sf = EV_SAFETY_NORMAL
-    
-    # Spread penalty based on IV rank (proxy for bid-ask spread width)
-    if iv_rank > 90:
-        spread_penalty = 3.0  # Extreme: likely unprofitable
-    elif iv_rank > 85:
-        spread_penalty = 2.0  # Wide spreads
-    elif iv_rank > 70:
-        spread_penalty = 1.5  # Elevated spreads
+
+    # Spread penalty based on absolute iv_proxy (not relative iv_rank percentile)
+    if iv_proxy > 2.0:
+        spread_penalty = 1.8
+    elif iv_proxy > 1.5:
+        spread_penalty = 1.5
+    elif iv_proxy > 1.2:
+        spread_penalty = 1.2
     else:
-        spread_penalty = 1.0  # Normal
-    
+        spread_penalty = 1.0
+
     return ev_predicted - (costs * sf * spread_penalty)
 
 
@@ -222,8 +270,9 @@ def check_iv_crush(row) -> float:
 
     Returns a confidence penalty to subtract from avg_conf.
     """
-    iv_rank = float(row.get('iv_rank_approx', 50))
-    iv_chg  = float(row.get('iv_pct_change',  0))
-    if iv_rank > 85 and iv_chg < 0:
+    iv_proxy = float(row.get('iv_proxy', 0.0))
+    iv_chg   = float(row.get('iv_pct_change', 0))
+    # High realized vol (iv_proxy > 1.5% annualised) AND contracting → IV crush risk
+    if iv_proxy > 1.5 and iv_chg < 0:
         return 0.10   # deduct 10% confidence when IV is crushing
     return 0.0

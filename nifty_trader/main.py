@@ -17,9 +17,19 @@ Usage:
     python angelone/daily_update.py --start 2026-02-21 --end 2026-02-26
 """
 import argparse
+import json
 import logging
+import os
 
 from .config import SKLEARN_OK
+
+def _read_capital_from_config() -> float:
+    try:
+        cfg_path = os.path.join(os.path.dirname(__file__), '..', 'config.json')
+        with open(cfg_path, encoding='utf-8') as f:
+            return float(json.load(f).get('capital', 30000.0))
+    except Exception:
+        return 30000.0
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +43,8 @@ def main():
     parser.add_argument("--mode", default="train",
                         choices=["train", "backtest", "live", "train_live", "paper", "dashboard"],
                         help="Operating mode")
-    parser.add_argument("--capital", type=float, default=10000,
-                        help="Starting capital in INR")
+    parser.add_argument("--capital", type=float, default=_read_capital_from_config(),
+                        help="Starting capital in INR (default: from config.json)")
     parser.add_argument("--verbose", action="store_true",
                         help="Show detailed CE/PE breakdown in dashboard")
     args = parser.parse_args()

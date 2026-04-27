@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 from collections import deque
+from typing import Optional
 import warnings
 
 from nifty_trader.data.loader import to_ist_naive
@@ -135,6 +136,10 @@ class BarValidator:
     def should_halt(self) -> bool:
         """Returns True when consecutive error count exceeds threshold."""
         return self._consecutive_errors >= self.HALT_ON_ERRORS
+    
+    def get_last_valid_timestamp(self) -> Optional[datetime]:
+        """Returns timestamp of last validated bar, or None if none validated yet."""
+        return self._prev_timestamp
 
     def reset(self):
         self._prev_close         = 0.0
@@ -425,36 +430,50 @@ class MarketStreamer:
             self.buy_volume = 0
             self.sell_volume = 0
     
-    def check_heartbeat(self, market_open: bool = True) -> bool:
+    def check_heartbeat(self, market_open: bool = True,
+                        minute_of_day: int = 0) -> bool:
         """Check if WebSocket is actually receiving data (zombie detection).
-        
+
         Returns: True if healthy, False if zombie (needs reconnect)
-        
-        2026 Edge: Network congestion can cause WebSocket to appear connected
-        but no data flows for 30+ seconds. During market hours, if tick_count
-        hasn't increased in 5 seconds, the connection is "zombie" and must be
-        force-reconnected.
+
+        Threshold is adaptive:
+          - Normal market hours      : 10s  (NIFTY ticks every 1-3s normally)
+          - Opening (< 9:30, < 15m)  : 20s  (first-minute order book settling)
+          - Lunch (12:15–13:00)      : 45s  (tick frequency drops to 1 per 20-30s;
+                                             a flat 10s threshold triggers false
+                                             reconnects during valid quiet periods)
+          - Pre-close (> 14:50)      : 20s  (thinner order book, wider ticks)
         """
         if not self.connected or not market_open:
             return True  # Can't check if not connected or market closed
-        
+
         with self.lock:
-            current_tick_count = self.tick_count
             last_tick_time = self.last_tick_time
-        
+
         # Skip check if no ticks received yet (initial connection phase)
         if last_tick_time is None:
             return True
-        
+
         time_since_last_tick = time.time() - last_tick_time
-        
-        # During market hours, no ticks for 10 seconds = zombie
-        # (Increased from 5s to reduce false positives during slow periods)
-        if market_open and time_since_last_tick > 10.0:
-            print(f"  [WARN] [Heartbeat] Zombie WebSocket detected! ")
-            print(f"      Last tick: {time_since_last_tick:.1f}s ago")
+
+        # Adaptive threshold — avoid false reconnects during low-volume windows
+        if 60 <= minute_of_day <= 105:    # 10:15–11:00 (opening settled, max volume)
+            threshold = 10.0
+        elif minute_of_day < 15:          # first 15 min: order book settling
+            threshold = 20.0
+        elif 180 <= minute_of_day <= 225: # 12:15–13:00 lunch
+            threshold = 45.0
+        elif minute_of_day >= 335:        # after 14:50 pre-close (335 = 14:50 - 09:15)
+            threshold = 20.0
+        else:
+            threshold = 10.0
+
+        if time_since_last_tick > threshold:
+            print(f"  [WARN] [Heartbeat] Zombie WebSocket detected! "
+                  f"Last tick: {time_since_last_tick:.1f}s ago "
+                  f"(threshold {threshold:.0f}s, min_of_day={minute_of_day})")
             return False
-        
+
         return True
     
     def force_reconnect(self):
@@ -583,6 +602,75 @@ def fetch_live_candles(session: 'AngelSession', n=250) -> pd.DataFrame | None:
         print(f"  Candle fetch error: {e}"); session._obj = None; return None
 
 
+def fetch_live_candles_multiday(session: 'AngelSession', days: int = 3) -> pd.DataFrame | None:
+    """
+    Fetch 1-min candles across multiple trading days by issuing one request
+    per calendar day and concatenating.
+
+    Angel One's ONE_MINUTE endpoint returns at most ~500 bars per request
+    (~one trading day = 375 bars).  A single request with fromdate N*375
+    minutes ago silently truncates to the current session only, returning
+    far fewer bars than requested.
+
+    Strategy: request each of the last `days` calendar days separately,
+    sleep 2.5s between calls (AB1004 guard), then concatenate and dedup.
+
+    Returns deduplicated, sorted DataFrame or None if all fetches fail.
+    """
+    obj = session.get()
+    if obj is None:
+        return None
+
+    frames = []
+    today = datetime.now().date()
+
+    for offset in range(days - 1, -1, -1):   # oldest day first
+        day = today - timedelta(days=offset)
+        if day.weekday() >= 5:                 # skip weekends
+            continue
+        fdt = datetime(day.year, day.month, day.day, 9, 0)
+        tdt = datetime(day.year, day.month, day.day, 15, 31)
+        if offset == 0:                        # today: todate = now
+            tdt = datetime.now()
+        try:
+            _api_limiter.wait_and_acquire(tokens=2)
+            r = obj.getCandleData({
+                "exchange": "NSE", "symboltoken": "99926000",
+                "interval": "ONE_MINUTE",
+                "fromdate": fdt.strftime("%Y-%m-%d %H:%M"),
+                "todate":   tdt.strftime("%Y-%m-%d %H:%M"),
+            })
+            if not r or not r.get('data'):
+                continue
+            df = pd.DataFrame(r['data'],
+                 columns=['datetime', 'open', 'high', 'low', 'close', 'volume'])
+            df['datetime'] = to_ist_naive(pd.to_datetime(df['datetime']))
+            for col in ['open', 'high', 'low', 'close']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            df['volume'] = pd.to_numeric(df.get('volume', 0), errors='coerce').fillna(0)
+            df = df.dropna(subset=['close'])
+            if not df.empty:
+                frames.append(df)
+                print(f"    Day {day}: {len(df)} bars fetched")
+        except Exception as e:
+            print(f"    Day {day}: fetch error — {e}")
+        if offset > 0:
+            time.sleep(2.5)   # AB1004 guard between day-requests
+
+    if not frames:
+        return None
+
+    out = pd.concat(frames, ignore_index=True)
+    out = out.drop_duplicates(subset='datetime', keep='last')
+    out = out.sort_values('datetime').reset_index(drop=True)
+
+    # Forward-fill missing 1-min slots within each session (ghost candle fix)
+    if len(out) > 1:
+        out = out.set_index('datetime').asfreq('1min', method='ffill').reset_index()
+
+    return out.dropna(subset=['close']).reset_index(drop=True)
+
+
 def fetch_live_htf(session: 'AngelSession', interval: str, n: int) -> pd.DataFrame | None:
     """Fetch higher-TF candles for live context with rate limiting."""
     # 2026 Edge: Rate limit to prevent 429 errors
@@ -639,33 +727,48 @@ def _fetch_with_retry(fetch_fn, *args, retries: int = 3, delay: float = 3.0, min
             result = fetch_fn(*args, **kwargs)
             if result is not None and len(result) >= min_rows:
                 return result
-            print(f"    Attempt {attempt}/{retries}: got {len(result) if result is not None else 0} rows "
-                  f"(need {min_rows}). Retrying in {delay}s...")
+            row_count = len(result) if result is not None else 0
+            # AB1004 rate-limit: result is empty (0 rows) — apply long delay
+            # The API returns AB1004 as a response body (not an exception),
+            # so we detect it by 0 rows right after a cold-start with many fetches.
+            retry_delay = 20.0 if row_count == 0 else delay
+            print(f"    Attempt {attempt}/{retries}: got {row_count} rows "
+                  f"(need {min_rows}). Retrying in {retry_delay}s...")
+            if attempt < retries:
+                time.sleep(retry_delay)
         except Exception as e:
             err_str = str(e)
-            retry_delay = 20.0 if 'TooMany' in err_str or 'AB1004' in err_str else delay
+            # AB1004 = rate-limited (old code), AB1019 = "Too many requests" (seen live)
+            # Match both error codes and the human-readable message variant
+            is_rate_limit = ('AB1004' in err_str or 'AB1019' in err_str or
+                             'Too many' in err_str or 'TooMany' in err_str or
+                             'too many' in err_str)
+            retry_delay = 20.0 if is_rate_limit else delay
             print(f"    Attempt {attempt}/{retries}: exception — {e}. Retrying in {retry_delay}s...")
             if attempt < retries:
                 time.sleep(retry_delay)
-            continue
-        if attempt < retries:
-            time.sleep(delay)
     return None
 
 
 def sync_historical_buffer(session: 'AngelSession') -> tuple:
     """
-    Cold-start sync: Pre-load 2 days of historical data before live loop starts.
+    Cold-start sync: Pre-load historical data before live loop starts.
 
-    Changes from v4.0:
-      - Each fetch now has retry logic (up to 3 attempts, 3s apart).
-        Angel One occasionally returns empty data on the first call after login.
-      - 1-min fetch threshold raised from 100 to 300 bars (one full day minimum)
-        to guarantee enough history for RSI(14) and EMA(200) warmup.
+    1-min fetch uses fetch_live_candles_multiday() — one API call per calendar
+    day — to work around Angel One's ~375-bar-per-request cap on ONE_MINUTE.
+    A single request for 1000 bars silently truncates to the current session
+    only (~200 bars early in the day), causing cold-start failure.
 
     Returns: (df_1m, df_5m, df_15m) — Pre-processed DataFrames ready for use
     """
     print("\n[Cold-Start Sync] Loading historical buffers...")
+
+    # Pre-sleep before first API call: Angel One enforces a burst window across
+    # sessions. If the script was restarted within the same rate-limit window
+    # (< 30s since last session's burst), the first fetch hits AB1019 immediately.
+    # A 12s wait clears the burst window and avoids wasting a retry slot.
+    print("  Waiting 12s to clear API rate-limit window...")
+    time.sleep(12)
 
     # 1. Fetch 2+ days of 15-min candles (with retry)
     print("  Fetching 15-min data (2 days)...")
@@ -676,7 +779,7 @@ def sync_historical_buffer(session: 'AngelSession') -> tuple:
     else:
         print(f"  [OK] Loaded {len(df_15m)} bars of 15-min data")
 
-    time.sleep(2)
+    time.sleep(5)  # AB1004 guard: ~2.5s minimum between API calls; 5s is safe
 
     # 2. Fetch 2+ days of 5-min candles (with retry)
     print("  Fetching 5-min data (2 days)...")
@@ -687,42 +790,98 @@ def sync_historical_buffer(session: 'AngelSession') -> tuple:
     else:
         print(f"  [OK] Loaded {len(df_5m)} bars of 5-min data")
 
-    time.sleep(2)
+    time.sleep(5)  # AB1004 guard
 
-    # 3. Fetch 1-min candles — must succeed; raise if it doesn't (live loop can't start without it)
-    print("  Fetching 1-min data (1000 bars)...")
-    df_1m = _fetch_with_retry(fetch_live_candles, session, 1000, min_rows=300)
-    if df_1m is None:
+    # 3. Fetch 1-min candles across multiple days.
+    # Angel One's ONE_MINUTE endpoint caps at ~375 bars per request (one session).
+    # fetch_live_candles_multiday() issues one request per calendar day and
+    # concatenates, giving up to 3 × 375 = 1125 bars without hitting the cap.
+    # min_rows is set to 50 (not 300) so a mid-session restart on a short day
+    # (e.g. Diwali muhurat trading or first bar after lunch restart) still succeeds.
+    print("  Fetching 1-min data (multi-day)...")
+    df_1m = None
+    for attempt in range(1, 4):
+        df_1m = fetch_live_candles_multiday(session, days=3)
+        if df_1m is not None and len(df_1m) >= 50:
+            break
+        print(f"    Attempt {attempt}/3: got {len(df_1m) if df_1m is not None else 0} bars. "
+              f"Retrying in 5s...")
+        time.sleep(5)
+    if df_1m is None or len(df_1m) < 50:
         print("  ERROR: 1-min data fetch failed after retries — cannot start live loop safely")
         return None, None, None
     else:
-        print(f"  [OK] Loaded {len(df_1m)} bars of 1-min data")
+        print(f"  [OK] Loaded {len(df_1m)} bars of 1-min data ({df_1m['datetime'].iloc[0].date()} "
+              f"to {df_1m['datetime'].iloc[-1].date()})")
     
     # 4. Pre-calculate all indicators so they're ready for live loop
     print("  Pre-calculating indicators...")
     try:
         # Add date/minute columns
         df_1m['date'] = df_1m['datetime'].dt.date
-        df_1m['minute_of_day'] = (df_1m['datetime'].dt.hour * 60 + 
+        df_1m['minute_of_day'] = (df_1m['datetime'].dt.hour * 60 +
                                   df_1m['datetime'].dt.minute) - (9*60 + 15)
-        
+
         # Calculate 1-min features
         df_1m = add_1min_features(df_1m)
-        
+
         # Add HTF features if available
         if not df_5m.empty:
             df_1m = add_htf_features(df_1m, df_5m, 'tf5_', [1, 3, 6])
-        
+
         if not df_15m.empty:
             df_1m = add_htf_features(df_1m, df_15m, 'tf15_', [1, 4])
-        
+
         print(f"  [OK] Indicators calculated. Buffer ready with {len(df_1m)} rows")
         print("[Cold-Start Sync] Complete. Live loop can start with full context.\n")
-        
+
         return df_1m, df_5m, df_15m
-        
+
     except Exception as e:
+        import traceback
         print(f"  ERROR during indicator calculation: {e}")
+        traceback.print_exc()
         return None, None, None
+
+
+def prefetch_instrument_master(session: 'AngelSession') -> bool:
+    """
+    Download the Angel One instrument master JSON at cold-start.
+
+    Without this, the first real order triggers a 10-15 second HTTP fetch
+    inside _get_option_token() while the market is moving.  Doing it here
+    at startup means token lookup at trade time is instant (cache hit).
+
+    Called from live_loop() after sync_historical_buffer() completes.
+    Returns True if successful, False if the download failed (non-fatal —
+    the broker will attempt a fresh download at trade time as fallback).
+    """
+    try:
+        # Import here to avoid circular import at module level
+        from ..execution.broker import BrokerOrderManager
+        import requests
+
+        url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+        print("  [Cold-Start] Downloading instrument master (for instant token lookup)...")
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        instruments = resp.json()
+
+        # Store on module-level singleton so BrokerOrderManager can reuse it
+        # without re-downloading.  BrokerOrderManager._get_instrument_data()
+        # checks self.instrument_list first — we pre-populate it here.
+        # We stash it in a module-level dict that broker.py checks at startup.
+        import pandas as pd
+        _instrument_cache['data']    = pd.DataFrame(instruments)
+        _instrument_cache['updated'] = __import__('datetime').date.today()
+        print(f"  [OK] Instrument master loaded: {len(instruments):,} instruments")
+        return True
+    except Exception as e:
+        print(f"  [WARN] Instrument master prefetch failed: {e} — will retry at trade time")
+        return False
+
+
+# Module-level instrument cache shared with broker.py
+_instrument_cache: dict = {'data': None, 'updated': None}
 
 

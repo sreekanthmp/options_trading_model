@@ -49,6 +49,15 @@ def add_1min_features_production(df: pd.DataFrame) -> pd.DataFrame:
     for n in [1, 3, 5, 10, 15, 30, 60]:
         df[f'ret_{n}m'] = c_lag1.pct_change(n) * 100
 
+    # Zero out returns whose lookback window spans overnight (different date than n bars ago).
+    # Without this, ret_5m at 9:20 AM uses yesterday's close as reference — injecting the
+    # overnight gap direction as an intraday signal, biasing models toward yesterday's trend.
+    if 'date' in df.columns:
+        for n in [1, 3, 5, 10, 15, 30, 60]:
+            date_n_ago = df['date'].shift(n)
+            overnight_mask = df['date'] != date_n_ago
+            df.loc[overnight_mask, f'ret_{n}m'] = 0.0
+
     # ------------------------------------------------------------------
     # ATR & IV
     # ------------------------------------------------------------------
@@ -64,8 +73,9 @@ def add_1min_features_production(df: pd.DataFrame) -> pd.DataFrame:
     df['iv_final'] = df['iv'].fillna(iv_proxy) if 'iv' in df.columns else iv_proxy
     df['iv_final'] = df['iv_final'].clip(0.02, 3.0)
 
-    iv_rank_window = min(60 * bars_per_day, len(df))
-    iv_rank = df['iv_final'].rolling(iv_rank_window, min_periods=bars_per_day).rank(pct=True) * 100
+    iv_rank_window = min(20 * bars_per_day, len(df))
+    iv_rank_min_periods = min(bars_per_day, iv_rank_window)
+    iv_rank = df['iv_final'].rolling(iv_rank_window, min_periods=iv_rank_min_periods).rank(pct=True) * 100
     df['iv_rank']        = iv_rank
     df['iv_rank_approx'] = iv_rank   # alias used by signal_generator
     df['iv_pct_change']  = df['iv_final'].pct_change(bars_per_day) * 100
@@ -208,7 +218,7 @@ def add_1min_features_production(df: pd.DataFrame) -> pd.DataFrame:
     # VWAP
     # ------------------------------------------------------------------
     typ = (h + lo + c) / 3
-    df['vwap'] = typ.groupby(df['date']).expanding().mean().reset_index(level=0, drop=True)
+    df['vwap'] = typ.groupby(df['date'], group_keys=False).apply(lambda g: g.expanding().mean())
     df['vwap_dist']  = (c - df['vwap']) / (df['vwap'] + EPS) * 100
     df['above_vwap'] = (c > df['vwap']).astype(int)
     df['vwap_slope'] = df['vwap_dist'].diff(5)
@@ -256,7 +266,7 @@ def add_1min_features_production(df: pd.DataFrame) -> pd.DataFrame:
     df['session_pct']  = df['minute_of_day'] / float(bars_per_day)
     dt_idx = pd.to_datetime(df['date'])
     df['dow']          = dt_idx.dt.dayofweek.astype(float)
-    df['is_expiry']    = (dt_idx.dt.dayofweek == 1).astype(int)  # 1 = Tuesday (NIFTY weekly expiry since Sep 2024)
+    df['is_expiry']    = (dt_idx.dt.dayofweek == 1).astype(int)  # 1 = Tuesday (NIFTY weekly expiry since Sep 2024 — was Thursday before)
     df['session_open'] = (df['minute_of_day'] < 30).astype(int)
     df['session_pm']   = (df['minute_of_day'] > 270).astype(int)  # after 13:45
 
@@ -300,6 +310,104 @@ def add_1min_features_production(df: pd.DataFrame) -> pd.DataFrame:
     df['bull_3bar'] = ((c.shift(2) < c.shift(1)) & (c.shift(1) < c) &
                        (c.shift(2) < op.shift(2)) & (c.shift(1) < op.shift(1)) &
                        (c > op)).astype(int)
+
+    # ------------------------------------------------------------------
+    # Price Action Structures (v4.2)
+    # Computed on every bar. Used by signal_generator Gate 7e (pattern
+    # alignment) and day_predictor opening-structure scorer.
+    # ------------------------------------------------------------------
+
+    # ── 1. Swing HH/HL / LH/LL structure ──────────────────────────────
+    # A swing high is a bar whose high is higher than the 3 bars on each
+    # side. A swing low is the mirror. We detect HH/HL (bullish structure)
+    # and LH/LL (bearish structure) over the last 20-bar window.
+    SWING_N = 3   # bars each side for pivot confirmation
+    STRUCT_W = 20  # window to count swings
+    pivot_hi = ((h == h.rolling(2 * SWING_N + 1, center=True).max())
+                .astype(float).shift(SWING_N))   # shift by SWING_N to avoid lookahead
+    pivot_lo = ((lo == lo.rolling(2 * SWING_N + 1, center=True).min())
+                .astype(float).shift(SWING_N))
+    df['pivot_hi'] = pivot_hi.fillna(0.0)
+    df['pivot_lo'] = pivot_lo.fillna(0.0)
+
+    # Compare the most recent two swing highs and two swing lows
+    # to determine HH/HL vs LH/LL structure.
+    def _structure_score(ph_series, pl_series, close_series, win):
+        """Return +1 (HH/HL bullish), -1 (LH/LL bearish), 0 (mixed)."""
+        scores = []
+        for i in range(len(ph_series)):
+            if i < win:
+                scores.append(0.0)
+                continue
+            ph_w = ph_series.iloc[i - win:i]
+            pl_w = pl_series.iloc[i - win:i]
+            ph_idx = ph_w[ph_w > 0].index
+            pl_idx = pl_w[pl_w > 0].index
+            if len(ph_idx) >= 2 and len(pl_idx) >= 2:
+                hi_vals = close_series.loc[ph_idx[-2:]]
+                lo_vals = close_series.loc[pl_idx[-2:]]
+                hh = float(hi_vals.iloc[-1]) > float(hi_vals.iloc[-2])
+                hl = float(lo_vals.iloc[-1]) > float(lo_vals.iloc[-2])
+                lh = float(hi_vals.iloc[-1]) < float(hi_vals.iloc[-2])
+                ll = float(lo_vals.iloc[-1]) < float(lo_vals.iloc[-2])
+                if hh and hl:
+                    scores.append(1.0)
+                elif lh and ll:
+                    scores.append(-1.0)
+                else:
+                    scores.append(0.0)
+            else:
+                scores.append(0.0)
+        return pd.Series(scores, index=ph_series.index)
+
+    df['struct_score'] = _structure_score(df['pivot_hi'], df['pivot_lo'], c, STRUCT_W)
+    # Smooth over 3 bars so a single noise bar doesn't flip the structure
+    df['struct_score'] = df['struct_score'].rolling(3, min_periods=1).mean()
+
+    # ── 2. Fair Value Gap (FVG) ────────────────────────────────────────
+    # Bullish FVG: bar[i-2].high < bar[i].low  (gap up between 2 bars ago and now)
+    # Bearish FVG: bar[i-2].low  > bar[i].high (gap down)
+    # Flag stays 1 for 5 bars (price tends to retest within ~5 bars or forget it).
+    fvg_bull_raw = (h.shift(2) < lo).astype(float)   # gap up
+    fvg_bear_raw = (lo.shift(2) > h).astype(float)   # gap down
+    df['fvg_bull'] = fvg_bull_raw.rolling(5, min_periods=1).max()
+    df['fvg_bear'] = fvg_bear_raw.rolling(5, min_periods=1).max()
+
+    # ── 3. Liquidity Sweep ─────────────────────────────────────────────
+    # Equal highs: previous swing high within 0.05% of current high.
+    # A sweep UP = price pokes above equal high then closes back inside (bear trap).
+    # A sweep DN = price pokes below equal low then closes back inside (bull trap).
+    EQ_TOL = 0.0005   # 0.05% tolerance for "equal" pivots
+    eq_hi = h.rolling(STRUCT_W).max()
+    eq_lo = lo.rolling(STRUCT_W).min()
+    # Sweep UP: high touches equal-high zone but close retreats below it
+    sweep_up = ((h >= eq_hi * (1 - EQ_TOL)) & (c < eq_hi)).astype(float)
+    # Sweep DN: low touches equal-low zone but close recovers above it
+    sweep_dn = ((lo <= eq_lo * (1 + EQ_TOL)) & (c > eq_lo)).astype(float)
+    df['liq_sweep_up'] = sweep_up   # bearish — long liquidity taken, likely reversal
+    df['liq_sweep_dn'] = sweep_dn   # bullish — short liquidity taken, likely reversal
+
+    # ── 4. NR4 / NR7 (Narrow Range compression) ───────────────────────
+    # NR4: today's bar range is the smallest of the last 4 bars (compression)
+    # NR7: smallest of last 7 bars (tighter squeeze, stronger breakout signal)
+    bar_range = (h - lo).clip(lower=EPS)
+    df['nr4'] = (bar_range == bar_range.rolling(4, min_periods=4).min()).astype(int)
+    df['nr7'] = (bar_range == bar_range.rolling(7, min_periods=7).min()).astype(int)
+
+    # ── 5. ORB strength & direction ───────────────────────────────────
+    # or_break_up / or_break_dn already computed above.
+    # Add distance above/below the OR boundary as a continuous feature.
+    # Positive = above OR high (CE friendly), negative = below OR low (PE friendly).
+    df['orb_dist'] = np.where(
+        df['or_break_up'] == 1,
+         (c - df['or_high']) / (df['or_range'].clip(lower=EPS) / 100 * c + EPS),
+        np.where(
+            df['or_break_dn'] == 1,
+            (c - df['or_low'])  / (df['or_range'].clip(lower=EPS) / 100 * c + EPS),
+            0.0
+        )
+    )
+    df['orb_dist'] = df['orb_dist'].clip(-5, 5)
 
     # ------------------------------------------------------------------
     # Feature interaction crosses (v3.2)
@@ -429,7 +537,7 @@ def add_htf_features(df1m: pd.DataFrame,
             f'{prefix}rsi', f'{prefix}macd_h', f'{prefix}bb_pos',
             f'{prefix}atr_pct', f'{prefix}ema9_21', f'{prefix}vol_10',
             f'{prefix}above_vwap', f'{prefix}adx', f'{prefix}cci',
-            f'{prefix}stoch_k', f'{prefix}willr']
+            f'{prefix}stoch_k', f'{prefix}willr', f'{prefix}close_chg']
         for col in cols:
             df1m[col] = 0.0
         return df1m
@@ -465,12 +573,18 @@ def add_htf_features(df1m: pd.DataFrame,
     k_h = (c - low14h) / (high14h - low14h + 1e-9) * 100
     d[f'{prefix}stoch_k'] = k_h
     d[f'{prefix}willr']   = -100 * (high14h - c) / (high14h - low14h + 1e-9)
+    # Raw close-to-close change in points (signed). Used by Gate5e-B momentum filter.
+    # Uses c_lag (shifted close) so the value seen by 1m bars is the completed HTF bar's move.
+    d[f'{prefix}close_chg'] = c_lag.diff(1)
 
-    # Forward-fill indicators that need longer warmup (ADX, CCI, MACD) to maximize data retention
-    # This is critical for 15-min data where we only get ~26 bars from the API
-    d[f'{prefix}adx'] = d[f'{prefix}adx'].ffill()
-    d[f'{prefix}cci'] = d[f'{prefix}cci'].ffill()
-    d[f'{prefix}macd_h'] = d[f'{prefix}macd_h'].ffill()
+    # Forward-fill AND back-fill indicators that need longer warmup (ADX, CCI, MACD).
+    # ffill: propagates last valid value forward (standard).
+    # bfill: fills leading NaNs at the start of the series with the first valid value.
+    # Without bfill, ADX is NaN for the first 28 bars → merges as 0.0 into 1m frame
+    # → adx_5m=0 in bar_log even when market is clearly trending.
+    d[f'{prefix}adx']    = d[f'{prefix}adx'].ffill().bfill()
+    d[f'{prefix}cci']    = d[f'{prefix}cci'].ffill().bfill()
+    d[f'{prefix}macd_h'] = d[f'{prefix}macd_h'].ffill().bfill()
     
     feat_cols = [col for col in d.columns if col.startswith(prefix)]
     # For 15-min data with limited bars, only require RSI (needs just 14 bars)
@@ -492,21 +606,65 @@ def add_htf_features(df1m: pd.DataFrame,
             print(f"      Time range: {df_htf['datetime'].min()} to {df_htf['datetime'].max()}")
             print(f"      Hint: Need more bars for indicator warmup (RSI=14, MACD=26, ADX=28)")
         for col in [f'{prefix}ret_{n}' for n in ret_periods] + \
-                   [f'{prefix}rsi', f'{prefix}macd_h', f'{prefix}bb_pos', 
+                   [f'{prefix}rsi', f'{prefix}macd_h', f'{prefix}bb_pos',
                     f'{prefix}atr_pct', f'{prefix}ema9_21', f'{prefix}vol_10',
                     f'{prefix}above_vwap', f'{prefix}adx', f'{prefix}cci',
-                    f'{prefix}stoch_k', f'{prefix}willr']:
+                    f'{prefix}stoch_k', f'{prefix}willr', f'{prefix}close_chg']:
             if col not in df1m.columns:
                 df1m[col] = 0.0
         return df1m
 
-    df1m = df1m.sort_values('datetime')
-    merged = pd.merge_asof(df1m, keep, on='datetime', direction='backward')
-    
-    # Fill NaN values for all expected HTF feature columns
+    # merge_asof requires sorted, no-duplicate, tz-naive keys.
+    # Use a temporary _dt_key column so we never modify the original datetime column.
+    # Defensive: if datetime became the index (e.g. after a merge), promote it back.
+    if 'datetime' not in df1m.columns and df1m.index.name == 'datetime':
+        df1m = df1m.reset_index()
+    if 'datetime' not in df1m.columns:
+        logger.warning(f"[HTF {prefix}] df1m missing 'datetime' column — columns: {list(df1m.columns[:10])}. Returning with zeros.")
+        for col in [f'{prefix}ret_{n}' for n in ret_periods] + \
+                   [f'{prefix}rsi', f'{prefix}macd_h', f'{prefix}bb_pos',
+                    f'{prefix}atr_pct', f'{prefix}ema9_21', f'{prefix}vol_10',
+                    f'{prefix}above_vwap', f'{prefix}adx', f'{prefix}cci',
+                    f'{prefix}stoch_k', f'{prefix}willr', f'{prefix}close_chg']:
+            if col not in df1m.columns:
+                df1m[col] = 0.0
+        return df1m
+    df1m = df1m.sort_values('datetime').reset_index(drop=True).copy()
+    # Drop any existing HTF columns with this prefix from a prior merge (cold-start or previous bar)
+    # to avoid merge_asof creating tf5_rsi_x/tf5_rsi_y duplicates that all become 0.
+    existing_htf = [c for c in df1m.columns if c.startswith(prefix)]
+    if existing_htf:
+        df1m = df1m.drop(columns=existing_htf)
+    df1m['_dt_key'] = pd.to_datetime(df1m['datetime']).dt.floor('min')
+    if hasattr(df1m['_dt_key'].dtype, 'tz') and df1m['_dt_key'].dtype.tz is not None:
+        df1m['_dt_key'] = df1m['_dt_key'].dt.tz_localize(None)
+
+    keep = keep.copy()
+    keep['_dt_key'] = pd.to_datetime(keep['datetime'])
+    if hasattr(keep['_dt_key'].dtype, 'tz') and keep['_dt_key'].dtype.tz is not None:
+        keep['_dt_key'] = keep['_dt_key'].dt.tz_localize(None)
+    keep = keep.sort_values('_dt_key').drop_duplicates(subset=['_dt_key'], keep='last').reset_index(drop=True)
+    # Drop 'datetime' from keep before merge_asof to avoid datetime_x/datetime_y collision
+    # which would silently rename df1m's 'datetime' and break subsequent HTF merges.
+    keep = keep.drop(columns=['datetime'], errors='ignore')
+
+    # Diagnostic: log key ranges if they look misaligned
+    if len(df1m) > 0 and len(keep) > 0:
+        df1m_min, df1m_max = df1m['_dt_key'].min(), df1m['_dt_key'].max()
+        keep_min, keep_max = keep['_dt_key'].min(), keep['_dt_key'].max()
+        if df1m_max < keep_min or df1m_min > keep_max:
+            logger.warning(f"[HTF {prefix}] No overlap: df1m=[{df1m_min} .. {df1m_max}] keep=[{keep_min} .. {keep_max}]")
+        logger.debug(f"[HTF {prefix}] merge_asof: df1m=[{df1m_min} .. {df1m_max}] keep=[{keep_min} .. {keep_max}] df1m_tz={df1m['_dt_key'].dtype} keep_tz={keep['_dt_key'].dtype}")
+    merged = pd.merge_asof(df1m, keep, on='_dt_key', direction='backward')
+    merged = merged.drop(columns=['_dt_key'])
+
+    # Fill NaN values for all expected HTF feature columns.
+    # ffill() first: carries last valid HTF value forward across all 1m bars
+    # (merge_asof gaps happen when dropna removed warmup rows from keep).
+    # fillna(0.0) as final fallback only for truly missing data at session start.
     for col in feat_cols:
         if col in merged.columns:
-            merged[col] = merged[col].fillna(0.0)
+            merged[col] = merged[col].ffill().fillna(0.0)
         else:
             # If column doesn't exist after merge, create it with zeros
             merged[col] = 0.0
@@ -528,9 +686,515 @@ def add_htf_features(df1m: pd.DataFrame,
                 print(f"  [WARN] [HTF {prefix}] Latest row has 0.0! "
                       f"non_zero={non_zero_pct:.1f}% ({non_zero_count}/{len(merged)}), "
                       f"df1m_time={merged['datetime'].iloc[-1]}, "
-                      f"htf_latest={keep['datetime'].max()}")
+                      f"htf_latest={keep['_dt_key'].max() if '_dt_key' in keep.columns else 'n/a'}")
+                print(f"  [WARN] [HTF {prefix}] keep rows={len(keep)}, "
+                      f"df1m_dt_range={merged['datetime'].min()} to {merged['datetime'].iloc[-1]}, "
+                      f"keep_sample_rsi={keep[sample_col].iloc[-3:].tolist() if len(keep)>=3 else keep[sample_col].tolist()}")
     
     return merged
+
+def compute_options_chain_features(options_dir: str) -> pd.DataFrame:
+    """
+    Compute daily options chain features from NSE bhavcopy CSVs.
+    Returns a DataFrame indexed by date with columns:
+      pcr_oi       — Put/Call ratio by open interest (>1.2 = bullish floor)
+      max_pain     — Strike where total OI loss for writers is minimum
+      atm_ce_oi    — CE open interest at nearest ATM strike
+      atm_pe_oi    — PE open interest at nearest ATM strike
+      iv_skew      — ATM PE close minus ATM CE close (positive = fear of downside)
+      oi_buildup   — Net OI change: PE chg_oi - CE chg_oi (positive = bullish)
+    """
+    import glob
+    records = []
+    files = sorted(glob.glob(os.path.join(options_dir, 'nifty_*.csv')))
+    for fpath in files:
+        try:
+            df = pd.read_csv(fpath)
+            if df.empty or 'option_type' not in df.columns:
+                continue
+            df = df[df['open_int'] > 0].copy()
+            if df.empty:
+                continue
+
+            # Parse date
+            date_str = os.path.basename(fpath).replace('nifty_', '').replace('.csv', '')
+            try:
+                trade_date = pd.to_datetime(date_str).date()
+            except Exception:
+                continue
+
+            # Spot estimate: weighted average of high-OI ATM strikes
+            df['strike'] = pd.to_numeric(df['strike'], errors='coerce')
+            df = df.dropna(subset=['strike'])
+            ce = df[df['option_type'] == 'CE']
+            pe = df[df['option_type'] == 'PE']
+
+            # PCR by OI
+            total_ce_oi = ce['open_int'].sum()
+            total_pe_oi = pe['open_int'].sum()
+            pcr_oi = total_pe_oi / (total_ce_oi + EPS)
+
+            # Spot estimate from max OI CE strike (highest gamma = closest to ATM)
+            if len(ce) == 0:
+                continue
+            spot_est = ce.loc[ce['open_int'].idxmax(), 'strike']
+
+            # ATM = strike nearest to spot
+            all_strikes = df['strike'].unique()
+            atm_strike = all_strikes[np.argmin(np.abs(all_strikes - spot_est))]
+
+            atm_ce = ce[ce['strike'] == atm_strike]
+            atm_pe = pe[pe['strike'] == atm_strike]
+            atm_ce_oi_val = atm_ce['open_int'].sum()
+            atm_pe_oi_val = atm_pe['open_int'].sum()
+            atm_ce_close  = atm_ce['close'].mean() if len(atm_ce) > 0 else 0.0
+            atm_pe_close  = atm_pe['close'].mean() if len(atm_pe) > 0 else 0.0
+            iv_skew       = atm_pe_close - atm_ce_close  # positive = put fear
+
+            # OI buildup: net PE - CE chg_oi (positive = smart money buying puts = bearish view)
+            pe_chg = pe['chg_oi'].sum() if 'chg_oi' in pe.columns else 0.0
+            ce_chg = ce['chg_oi'].sum() if 'chg_oi' in ce.columns else 0.0
+            oi_buildup = pe_chg - ce_chg
+
+            # Max pain: strike where total loss for all option writers is minimum
+            # Only check strikes within 1500 pts of spot (avoid illiquid far OTM)
+            near_strikes = all_strikes[np.abs(all_strikes - spot_est) <= 1500]
+            pain = {}
+            for s in near_strikes:
+                ce_loss = ((s - ce[ce['strike'] < s]['strike']) *
+                           ce[ce['strike'] < s]['open_int']).sum()
+                pe_loss = ((pe[pe['strike'] > s]['strike'] - s) *
+                           pe[pe['strike'] > s]['open_int']).sum()
+                pain[s] = ce_loss + pe_loss
+            max_pain_val = min(pain, key=pain.get) if pain else spot_est
+            # Express max pain as % distance from spot
+            max_pain_dist = (max_pain_val - spot_est) / (spot_est + EPS) * 100
+
+            records.append({
+                'date':          trade_date,
+                'pcr_oi':        round(float(pcr_oi), 4),
+                'max_pain_dist': round(float(max_pain_dist), 4),
+                'atm_ce_oi':     round(float(atm_ce_oi_val), 0),
+                'atm_pe_oi':     round(float(atm_pe_oi_val), 0),
+                'iv_skew':       round(float(iv_skew), 2),
+                'oi_buildup':    round(float(oi_buildup), 0),
+            })
+        except Exception as e:
+            logger.debug(f"[OptionsFeatures] Skipped {fpath}: {e}")
+            continue
+
+    if not records:
+        logger.warning("[OptionsFeatures] No options data loaded — all features will be 0")
+        return pd.DataFrame(columns=['date','pcr_oi','max_pain_dist','atm_ce_oi',
+                                     'atm_pe_oi','iv_skew','oi_buildup'])
+    result = pd.DataFrame(records).sort_values('date').reset_index(drop=True)
+    logger.info(f"[OptionsFeatures] Loaded {len(result)} days of options chain features "
+                f"({result['date'].min()} to {result['date'].max()})")
+    return result
+
+
+def add_options_chain_features(df1m: pd.DataFrame,
+                                options_df: pd.DataFrame | None) -> pd.DataFrame:
+    """
+    Merge daily options chain features into 1-min dataframe.
+    Uses PREVIOUS day's options data (avoid lookahead — today's OI isn't
+    known until end of day).
+    """
+    opt_cols = ['pcr_oi', 'max_pain_dist', 'atm_ce_oi', 'atm_pe_oi',
+                'iv_skew', 'oi_buildup']
+
+    # Drop existing to prevent _x/_y merge collision
+    df1m = df1m.drop(columns=[c for c in opt_cols if c in df1m.columns])
+
+    if options_df is None or options_df.empty:
+        for col in opt_cols:
+            df1m[col] = 0.0
+        return df1m
+
+    opt = options_df.copy()
+    opt['date'] = pd.to_datetime(opt['date']).dt.date
+    # Shift by 1 day: use yesterday's options data for today's signals
+    opt['date'] = opt['date'].apply(lambda d: d)
+    opt = opt.rename(columns={'date': 'prev_opt_date'})
+
+    # Build a date → next_trading_date map
+    all_dates = sorted(df1m['date'].unique())
+    date_to_next = {}
+    for i, d in enumerate(all_dates):
+        if i + 1 < len(all_dates):
+            date_to_next[opt['prev_opt_date'].iloc[0].__class__(d.year, d.month, d.day)] = all_dates[i + 1]
+
+    # Map options date → next trading day (so today's 1m bars use yesterday's OI)
+    opt_mapped = opt.copy()
+    opt_mapped['date'] = opt_mapped['prev_opt_date'].apply(
+        lambda d: date_to_next.get(d, None)
+    )
+    opt_mapped = opt_mapped.dropna(subset=['date'])
+    opt_mapped = opt_mapped[['date'] + opt_cols]
+
+    df1m = df1m.merge(opt_mapped, on='date', how='left')
+
+    # Normalize ATM OI to ratio (CE OI / total) — more stable than raw OI counts
+    total_atm_oi = df1m['atm_ce_oi'] + df1m['atm_pe_oi'] + EPS
+    df1m['atm_oi_skew'] = (df1m['atm_pe_oi'] - df1m['atm_ce_oi']) / total_atm_oi
+    opt_cols.append('atm_oi_skew')
+
+    # Fill missing (days before options data starts)
+    for col in opt_cols:
+        df1m[col] = df1m[col].ffill().fillna(0.0)
+
+    return df1m
+
+
+def load_vix_data(vix_path: str = 'india_vix.csv') -> pd.DataFrame:
+    """Load and preprocess India VIX CSV once. Returns shifted DataFrame ready to merge."""
+    vix_cols = ['day_vix', 'day_vix_regime', 'day_vix_chg']
+    if not os.path.exists(vix_path):
+        logger.warning(f"[VIX] {vix_path} not found — run india_vix_downloader.py.")
+        return pd.DataFrame(columns=['date'] + vix_cols)
+
+    vix = pd.read_csv(vix_path)
+    vix['date'] = pd.to_datetime(vix['date']).dt.date
+    vix = vix.sort_values('date').drop_duplicates('date')
+    vix['day_vix']        = vix['vix_close']
+    vix['day_vix_regime'] = pd.cut(vix['vix_close'],
+                                    bins=[0, 13, 20, 999],
+                                    labels=[0, 1, 2]).astype(float)
+    vix5avg = vix['vix_close'].rolling(5, min_periods=1).mean()
+    vix['day_vix_chg'] = (vix['vix_close'] - vix5avg) / (vix5avg + EPS) * 100
+    vix['date_next'] = vix['date'].shift(-1)
+    vix_use = vix[['date_next', 'day_vix', 'day_vix_regime', 'day_vix_chg']].dropna(subset=['date_next'])
+    vix_use = vix_use.rename(columns={'date_next': 'date'})
+    vix_use['date'] = pd.to_datetime(vix_use['date']).dt.date
+    return vix_use, vix['day_vix'].min(), vix['day_vix'].max()
+
+
+def add_vix_features(df1m: pd.DataFrame, vix_path: str = 'india_vix.csv',
+                     vix_df: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Add India VIX as daily features to 1-min dataframe.
+    Pass vix_df (from load_vix_data()) to avoid re-reading CSV every bar.
+    """
+    vix_cols = ['day_vix', 'day_vix_regime', 'day_vix_chg']
+    df1m = df1m.drop(columns=[c for c in vix_cols if c in df1m.columns])
+
+    if vix_df is None:
+        result = load_vix_data(vix_path)
+        if isinstance(result, tuple):
+            vix_df, vmin, vmax = result
+        else:
+            vix_df = result
+            vmin = vmax = 0.0
+    else:
+        vmin = vmax = 0.0
+
+    if vix_df.empty:
+        for col in vix_cols:
+            df1m[col] = 0.0
+        return df1m
+
+    df1m = df1m.merge(vix_df, on='date', how='left')
+    for col in vix_cols:
+        df1m[col] = df1m[col].ffill().fillna(0.0)
+
+    if vmin != vmax:
+        logger.info(f"[VIX] Added VIX features. Range: {vmin:.1f}–{vmax:.1f}")
+    else:
+        logger.info(f"[VIX] Added VIX features.")
+    return df1m
+
+
+# ==============================================================================
+# TIER 1 + TIER 2 CONTEXTUAL FEATURES
+# ==============================================================================
+
+def add_calendar_features(df1m: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add day-of-week and expiry-week flags.
+
+    Features added:
+      day_of_week    — 0=Mon, 1=Tue, ..., 4=Fri (Monday opens weak, Friday expiry effect)
+      is_expiry_week — 1 if current week contains Tuesday (NIFTY weekly expiry week)
+      is_monday      — 1 on Monday (gap-prone, often weak open)
+      is_friday      — 1 on Friday (position squaring, end-of-week moves)
+    """
+    cols = ['day_of_week', 'is_expiry_week', 'is_monday', 'is_friday']
+    df1m = df1m.drop(columns=[c for c in cols if c in df1m.columns])
+
+    dt = pd.to_datetime(df1m['datetime'] if 'datetime' in df1m.columns else df1m.index)
+    df1m['day_of_week']    = dt.dt.dayofweek.astype(float)
+    df1m['is_monday']      = (dt.dt.dayofweek == 0).astype(float)
+    df1m['is_friday']      = (dt.dt.dayofweek == 4).astype(float)
+
+    # Expiry week: week that contains Tuesday (NIFTY weekly expiry since Sep 2024)
+    # A week contains Tuesday if any day Mon-Fri of that ISO week is a Tuesday.
+    # Simplest: day_of_week <= 1 means Tuesday hasn't happened yet this week,
+    # day_of_week >= 1 means this week has/had a Tuesday.
+    # Since NIFTY expiry is every Tuesday, every trading week is expiry week —
+    # so we use a more useful definition: flag the 2 days around expiry (Mon+Tue).
+    df1m['is_expiry_week'] = (dt.dt.dayofweek <= 1).astype(float)  # Mon=0, Tue=1
+
+    logger.info("[Calendar] Added day-of-week and expiry-week features.")
+    return df1m
+
+
+def load_futures_basis_data(futures_path: str = 'nifty_futures_daily.csv') -> pd.DataFrame:
+    """Load and preprocess futures basis CSV once. Returns shifted DataFrame ready to merge."""
+    cols = ['futures_basis', 'futures_basis_chg']
+    if not os.path.exists(futures_path):
+        logger.warning(f"[Futures] {futures_path} not found — run nifty_futures_downloader.py.")
+        return pd.DataFrame(columns=['date'] + cols)
+
+    fut = pd.read_csv(futures_path)
+    fut['date'] = pd.to_datetime(fut['date']).dt.date
+    fut = fut.sort_values('date').drop_duplicates('date')
+
+    # Sanity check: NIFTY futures basis should be 0.0–2.0% normally.
+    # Values >3% indicate wrong data (raw point diff, not %). Fall back to empty.
+    if fut['futures_basis'].abs().median() > 3.0:
+        logger.warning(f"[Futures] futures_basis median={fut['futures_basis'].abs().median():.2f}% "
+                       f"— looks wrong (expected <3%). Setting to 0 to avoid feature drift.")
+        return pd.DataFrame(columns=['date'] + cols)
+
+    fut['futures_basis_chg'] = fut['futures_basis'].diff()
+    fut['date_next'] = fut['date'].shift(-1)
+    fut_use = fut[['date_next', 'futures_basis', 'futures_basis_chg']].dropna(subset=['date_next'])
+    fut_use = fut_use.rename(columns={'date_next': 'date'})
+    fut_use['date'] = pd.to_datetime(fut_use['date']).dt.date
+    return fut_use
+
+
+def add_futures_basis_features(df1m: pd.DataFrame,
+                                futures_path: str = 'nifty_futures_daily.csv',
+                                futures_df: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Add Nifty futures basis as a daily feature.
+    Pass futures_df (from load_futures_basis_data()) to avoid re-reading CSV every bar.
+    """
+    cols = ['futures_basis', 'futures_basis_chg']
+    df1m = df1m.drop(columns=[c for c in cols if c in df1m.columns])
+
+    if futures_df is None:
+        futures_df = load_futures_basis_data(futures_path)
+
+    if futures_df.empty:
+        for col in cols:
+            df1m[col] = 0.0
+        return df1m
+
+    df1m = df1m.merge(futures_df, on='date', how='left')
+    for col in cols:
+        df1m[col] = df1m[col].ffill().fillna(0.0)
+
+    logger.info(f"[Futures] Added futures basis features.")
+    return df1m
+
+
+def load_fii_dii_data(fii_path: str = 'fii_dii_flow.csv') -> pd.DataFrame:
+    """Load and preprocess FII/DII CSV once. Returns shifted DataFrame ready to merge."""
+    cols = ['fii_net_buy', 'dii_net_buy', 'fii_dii_net', 'fii_flow_regime', 'fii_5d_cumulative']
+    if not os.path.exists(fii_path):
+        logger.warning(f"[FII] {fii_path} not found — run fii_dii_downloader.py.")
+        return pd.DataFrame(columns=['date'] + cols)
+
+    fii = pd.read_csv(fii_path)
+    fii['date'] = pd.to_datetime(fii['date']).dt.date
+    fii = fii.sort_values('date').drop_duplicates('date')
+    fii['fii_dii_net']       = fii['fii_net_buy'] + fii['dii_net_buy']
+    fii['fii_flow_regime']   = pd.cut(fii['fii_net_buy'],
+                                       bins=[-999999, -2000, 2000, 999999],
+                                       labels=[-1, 0, 1]).astype(float)
+    fii['fii_5d_cumulative'] = fii['fii_net_buy'].rolling(5, min_periods=1).sum()
+    fii['date_next'] = fii['date'].shift(-1)
+    fii_use = fii[['date_next', 'fii_net_buy', 'dii_net_buy', 'fii_dii_net',
+                   'fii_flow_regime', 'fii_5d_cumulative']].dropna(subset=['date_next'])
+    fii_use = fii_use.rename(columns={'date_next': 'date'})
+    fii_use['date'] = pd.to_datetime(fii_use['date']).dt.date
+    return fii_use
+
+
+def add_fii_dii_features(df1m: pd.DataFrame,
+                          fii_path: str = 'fii_dii_flow.csv',
+                          fii_df: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Add FII/DII daily flow as features.
+    Pass fii_df (from load_fii_dii_data()) to avoid re-reading CSV every bar.
+    """
+    cols = ['fii_net_buy', 'dii_net_buy', 'fii_dii_net', 'fii_flow_regime', 'fii_5d_cumulative']
+    df1m = df1m.drop(columns=[c for c in cols if c in df1m.columns])
+
+    if fii_df is None:
+        fii_df = load_fii_dii_data(fii_path)
+
+    if fii_df.empty:
+        for col in cols:
+            df1m[col] = 0.0
+        return df1m
+
+    df1m = df1m.merge(fii_df, on='date', how='left')
+    for col in cols:
+        df1m[col] = df1m[col].ffill().fillna(0.0)
+
+    logger.info(f"[FII] Added FII/DII flow features. {len(fii_df)} days loaded.")
+    return df1m
+
+
+def load_sp500_data(sp500_path: str = 'sp500_daily.csv') -> pd.DataFrame:
+    """Load and preprocess S&P 500 CSV once. Returns shifted DataFrame ready to merge."""
+    cols = ['sp500_ret_1d', 'sp500_ret_5d', 'global_risk_on']
+    if not os.path.exists(sp500_path):
+        logger.warning(f"[SP500] {sp500_path} not found — run sp500_downloader.py.")
+        return pd.DataFrame(columns=['date'] + cols)
+
+    sp = pd.read_csv(sp500_path)
+    sp['date'] = pd.to_datetime(sp['date']).dt.date
+    sp = sp.sort_values('date').drop_duplicates('date')
+    sp['sp500_ret_1d'] = sp['close'].pct_change(1) * 100
+    sp['sp500_ret_5d'] = sp['close'].pct_change(5) * 100
+    sp['global_risk_on'] = pd.cut(sp['sp500_ret_1d'],
+                                   bins=[-999, -0.5, 0.5, 999],
+                                   labels=[-1, 0, 1]).astype(float)
+    # S&P 500 closes at ~2:30 AM IST (next calendar day).
+    sp['date_next'] = sp['date'].shift(-1)
+    sp_use = sp[['date_next', 'sp500_ret_1d', 'sp500_ret_5d', 'global_risk_on']].dropna(subset=['date_next'])
+    sp_use = sp_use.rename(columns={'date_next': 'date'})
+    sp_use['date'] = pd.to_datetime(sp_use['date']).dt.date
+    return sp_use
+
+
+def add_global_market_features(df1m: pd.DataFrame,
+                                 sp500_path: str = 'sp500_daily.csv',
+                                 sp500_df: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Add US S&P 500 previous close return as global risk-on/off context.
+    Pass sp500_df (from load_sp500_data()) to avoid re-reading CSV every bar.
+    """
+    cols = ['sp500_ret_1d', 'sp500_ret_5d', 'global_risk_on']
+    df1m = df1m.drop(columns=[c for c in cols if c in df1m.columns])
+
+    if sp500_df is None:
+        sp500_df = load_sp500_data(sp500_path)
+
+    if sp500_df.empty:
+        for col in cols:
+            df1m[col] = 0.0
+        return df1m
+
+    df1m = df1m.merge(sp500_df, on='date', how='left')
+    for col in cols:
+        df1m[col] = df1m[col].ffill().fillna(0.0)
+
+    logger.info(f"[SP500] Added global market features. {len(sp500_df)} days loaded.")
+    return df1m
+
+
+def compute_pcr_volume_features(options_dir: str = 'nifty_options_data') -> pd.DataFrame:
+    """
+    Read all daily options CSVs once and return a DataFrame of PCR volume +
+    ATM IV features indexed by date. Call this ONCE at startup, then pass the
+    result to add_pcr_volume_features() every bar.
+    """
+    import glob
+    cols = ['pcr_vol', 'pcr_oi_vol_diff', 'atm_iv_ce', 'atm_iv_pe', 'atm_iv_avg']
+    records = []
+    files = sorted(glob.glob(os.path.join(options_dir, 'nifty_*.csv')))
+
+    for fpath in files:
+        try:
+            df = pd.read_csv(fpath)
+            if df.empty or 'option_type' not in df.columns:
+                continue
+            date_str = os.path.basename(fpath).replace('nifty_', '').replace('.csv', '')
+            try:
+                trade_date = pd.to_datetime(date_str).date()
+            except Exception:
+                continue
+
+            df['strike']    = pd.to_numeric(df['strike'],    errors='coerce')
+            df['contracts'] = pd.to_numeric(df['contracts'], errors='coerce').fillna(0)
+            df['close']     = pd.to_numeric(df['close'],     errors='coerce').fillna(0)
+            df['open_int']  = pd.to_numeric(df['open_int'],  errors='coerce').fillna(0)
+            df = df.dropna(subset=['strike'])
+
+            ce = df[df['option_type'] == 'CE']
+            pe = df[df['option_type'] == 'PE']
+            if len(ce) == 0:
+                continue
+
+            total_ce_vol    = ce['contracts'].sum()
+            total_pe_vol    = pe['contracts'].sum()
+            pcr_vol         = total_pe_vol / (total_ce_vol + EPS)
+            total_ce_oi     = ce['open_int'].sum()
+            total_pe_oi     = pe['open_int'].sum()
+            pcr_oi_val      = total_pe_oi / (total_ce_oi + EPS)
+            pcr_oi_vol_diff = pcr_oi_val - pcr_vol
+
+            spot_est    = ce.loc[ce['open_int'].idxmax(), 'strike'] if ce['open_int'].sum() > 0 else ce['strike'].median()
+            all_strikes = df['strike'].unique()
+            atm_strike  = all_strikes[np.argmin(np.abs(all_strikes - spot_est))]
+            atm_ce_row  = ce[ce['strike'] == atm_strike]
+            atm_pe_row  = pe[pe['strike'] == atm_strike]
+            atm_ce_close = atm_ce_row['close'].mean() if len(atm_ce_row) > 0 else 0.0
+            atm_pe_close = atm_pe_row['close'].mean() if len(atm_pe_row) > 0 else 0.0
+            atm_iv_ce   = (atm_ce_close / (spot_est + EPS)) * np.sqrt(252) * 100
+            atm_iv_pe   = (atm_pe_close / (spot_est + EPS)) * np.sqrt(252) * 100
+            atm_iv_avg  = (atm_iv_ce + atm_iv_pe) / 2.0
+
+            records.append({
+                'date':            trade_date,
+                'pcr_vol':         round(float(pcr_vol), 4),
+                'pcr_oi_vol_diff': round(float(pcr_oi_vol_diff), 4),
+                'atm_iv_ce':       round(float(atm_iv_ce), 2),
+                'atm_iv_pe':       round(float(atm_iv_pe), 2),
+                'atm_iv_avg':      round(float(atm_iv_avg), 2),
+            })
+        except Exception as e:
+            logger.debug(f"[PCRVol] Skipped {fpath}: {e}")
+            continue
+
+    if not records:
+        logger.warning("[PCRVol] No data loaded")
+        return pd.DataFrame(columns=['date'] + cols)
+
+    result = pd.DataFrame(records).sort_values('date').reset_index(drop=True)
+    logger.info(f"[PCRVol] Computed PCR-volume + ATM IV features. {len(result)} days.")
+    return result
+
+
+def add_pcr_volume_features(df1m: pd.DataFrame,
+                              pcr_df: pd.DataFrame | None = None,
+                              options_dir: str = 'nifty_options_data') -> pd.DataFrame:
+    """
+    Merge pre-computed PCR volume + ATM IV features into 1-min dataframe.
+    Pass pcr_df from compute_pcr_volume_features() for live use (fast).
+    If pcr_df is None, computes from scratch (training use only).
+    """
+    cols = ['pcr_vol', 'pcr_oi_vol_diff', 'atm_iv_ce', 'atm_iv_pe', 'atm_iv_avg']
+    df1m = df1m.drop(columns=[c for c in cols if c in df1m.columns])
+
+    if pcr_df is None:
+        pcr_df = compute_pcr_volume_features(options_dir)
+
+    if pcr_df is None or pcr_df.empty:
+        for col in cols:
+            df1m[col] = 0.0
+        return df1m
+
+    result = pcr_df.copy()
+    result['date'] = pd.to_datetime(result['date']).dt.date
+    # Shift by 1 day (no lookahead)
+    result['date_next'] = result['date'].shift(-1)
+    result_use = result[['date_next'] + cols].dropna(subset=['date_next'])
+    result_use = result_use.rename(columns={'date_next': 'date'})
+    result_use['date'] = pd.to_datetime(result_use['date']).dt.date
+
+    df1m = df1m.merge(result_use, on='date', how='left')
+    for col in cols:
+        df1m[col] = df1m[col].ffill().fillna(0.0)
+
+    logger.info(f"[PCRVol] Added PCR-volume + ATM IV features. {len(pcr_df)} days.")
+    return df1m
+
 
 def add_daily_features(df1m: pd.DataFrame,
                        df1d: pd.DataFrame | None) -> pd.DataFrame:
@@ -607,7 +1271,8 @@ def add_daily_features(df1m: pd.DataFrame,
         df1m['prev_low'] = df1m.groupby('date')['low'].transform('first').shift(1).ffill()
 
     # Derived calculations
-    df1m['gap_pct']          = (df1m['open'] - df1m['prev_close']) / (df1m['prev_close']+1e-9)*100
+    day_open                 = df1m.groupby('date')['open'].transform('first')
+    df1m['gap_pct']          = (day_open - df1m['prev_close']) / (df1m['prev_close']+1e-9)*100
     df1m['above_prev_close'] = (df1m['close'] > df1m['prev_close']).astype(int).fillna(0)
     df1m['dist_prev_hi']     = (df1m['close'] - df1m['prev_high']) / (df1m['close']+1e-9)*100
     df1m['dist_prev_lo']     = (df1m['close'] - df1m['prev_low'])  / (df1m['close']+1e-9)*100
@@ -643,6 +1308,37 @@ FEATURE_LIVE_OK = {
     # Experimental features (OFF by default until proven in paper trading)
     'fft_cycle': False,               # FFT now handled separately as regime hint
     'cycle_vol_interaction': False,   # Dependent on fft_cycle
+    # Options chain + VIX: available live (daily CSV files loaded at startup)
+    'pcr_oi': True,
+    'max_pain_dist': True,
+    'iv_skew': True,
+    'oi_buildup': True,
+    'atm_oi_skew': True,
+    'day_vix': True,
+    'day_vix_regime': True,
+    'day_vix_chg': True,
+    # Calendar: always available (derived from datetime)
+    'day_of_week': True,
+    'is_expiry_week': True,
+    'is_monday': True,
+    'is_friday': True,
+    # PCR volume + ATM IV: available live (options_data CSVs)
+    'pcr_vol': True,
+    'pcr_oi_vol_diff': True,
+    'atm_iv_ce': True,
+    'atm_iv_pe': True,
+    'atm_iv_avg': True,
+    # External data: available live if CSV files present
+    'futures_basis': True,       # bad CSV auto-detected and zeroed in add_futures_basis_features
+    'futures_basis_chg': True,
+    'fii_net_buy': True,
+    'dii_net_buy': True,
+    'fii_dii_net': True,
+    'fii_flow_regime': True,
+    'fii_5d_cumulative': True,
+    'sp500_ret_1d': True,
+    'sp500_ret_5d': True,
+    'global_risk_on': True,
 }
 
 # Tier-1: Core features (max 30, always enabled)
@@ -770,6 +1466,51 @@ def get_feature_cols():
         'ta_trend_score',     # Combined EMA + ADX + Supertrend + DMI score (-1 to +1)
         'ta_flow_score',      # MFI-based money flow score (-1 to +1)
         'ta_overall_score',   # Overall TA bias combining all components (-2 to +2)
+
+        # ----- GROUP E: Options chain + India VIX (daily, shift-1, no lookahead) -----
+        'pcr_oi',         # Put/Call OI ratio (>1.2 = bullish floor)
+        'max_pain_dist',  # Distance from ATM to max pain strike (normalized)
+        'iv_skew',        # PE IV - CE IV (>0 = fear premium, puts expensive)
+        'oi_buildup',     # Net OI buildup direction (+1 CE, -1 PE dominant)
+        'atm_oi_skew',    # (ATM PE OI - ATM CE OI) / sum (directional bias)
+        'day_vix',        # Previous day India VIX close (raw level)
+        'day_vix_regime', # 0=low(<13), 1=normal(13-20), 2=high(>20)
+        'day_vix_chg',    # VIX % change vs 5-day avg (momentum)
+
+        # ----- GROUP F: Calendar context (derived from datetime, zero cost) -----
+        'day_of_week',    # 0=Mon..4=Fri (each day has distinct NIFTY behavior)
+        'is_expiry_week', # 1 on Mon/Tue (expiry-week positioning effect)
+        'is_monday',      # 1 on Monday (gap-prone, often weak open)
+        'is_friday',      # 1 on Friday (position squaring, end-of-week moves)
+
+        # ----- GROUP G: PCR volume + ATM IV absolute level -----
+        'pcr_vol',         # PCR by volume (fresh daily positioning)
+        'pcr_oi_vol_diff', # OI vs volume PCR divergence (sentiment shift signal)
+        'atm_iv_ce',       # ATM CE IV proxy (absolute, not rank)
+        'atm_iv_pe',       # ATM PE IV proxy
+        'atm_iv_avg',      # Average ATM IV (options expensive vs cheap)
+
+        # ----- GROUP H: External macro (Tier 1+2, requires CSV downloaders) -----
+        'futures_basis',     # Nifty futures premium/discount % vs spot
+        'futures_basis_chg', # Change in basis (momentum)
+        'fii_net_buy',       # FII net buy/sell crores (institutional flow)
+        'dii_net_buy',       # DII net buy/sell crores
+        'fii_dii_net',       # Combined FII+DII net flow
+        'fii_flow_regime',   # -1=heavy selling, 0=neutral, 1=heavy buying
+        'fii_5d_cumulative', # 5-day rolling FII flow (trend)
+        'sp500_ret_1d',      # S&P 500 previous day return %
+        'sp500_ret_5d',      # S&P 500 5-day return %
+        'global_risk_on',    # -1/0/1 risk-off/neutral/risk-on
+
+        # ----- GROUP I: Price Action Structures (v4.2) -----
+        'struct_score',   # +1=HH/HL bullish structure, -1=LH/LL bearish, 0=mixed
+        'fvg_bull',       # fair value gap bullish (gap up imbalance in last 5 bars)
+        'fvg_bear',       # fair value gap bearish (gap down imbalance in last 5 bars)
+        'liq_sweep_up',   # liquidity sweep of equal highs (potential bearish reversal)
+        'liq_sweep_dn',   # liquidity sweep of equal lows (potential bullish reversal)
+        'nr4',            # NR4 inside compression (breakout setup)
+        'nr7',            # NR7 tight compression (stronger breakout signal)
+        'orb_dist',       # distance from OR boundary (ORB strength)
 
         # ----- DISABLED (unavailable live — excluded via FEATURE_LIVE_OK) -----
         'option_chain_ndi',

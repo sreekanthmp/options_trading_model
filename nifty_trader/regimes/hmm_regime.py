@@ -78,17 +78,25 @@ def intraday_regime_override(row, reg: int) -> int:
 
     # Rule 2b: HMM says CRISIS but intraday signals are calm and trending.
     # Conditions for downgrade (all must be true):
-    #   - IV not spiking (< 10% change) — no real panic
-    #   - ADX >= 25 — market has clear direction
-    #   - ATR ratio < 1.5 — volatility not abnormally wide
+    #   - IV not spiking (< 15% change) — no real panic
+    #   - 5m ADX >= 20 OR 1m ADX >= 25 — at least one TF shows direction
+    #   - ATR ratio < 1.8 — volatility not abnormally wide
+    #
+    # WHY relaxed: 1m ADX is noisy — a strong trending day often shows ADX 13-22
+    # on 1m while the 5m ADX is clearly above 20. Old threshold (ADX>=25 on 1m)
+    # never fired because 1m ADX stays low even on 600pt moves.
+    # iv_pct_change=0.0 on most bars (feature not computed live) — use < 15 not < 10
+    # so the rule fires even when IV feature is zero (neutral, not spiking).
     if reg == REGIME_CRISIS:
         iv_change  = row.get('iv_pct_change', 0)
-        adx        = row.get('adx_14', 0)
+        adx_1m     = row.get('adx_14', 0)
+        adx_5m     = row.get('tf5_adx', adx_1m)
         atr_ratio  = row.get('atr_ratio', 1.0)
-        if iv_change < 10 and adx >= 25 and atr_ratio < 1.5:
+        trending_signal = adx_5m >= 20 or adx_1m >= 25
+        if iv_change < 15 and trending_signal and atr_ratio < 1.8:
             logger.info(
                 f"[RegimeOverride] CRISIS->TRENDING: IV_chg={iv_change:.1f}% "
-                f"ADX={adx:.1f} ATR_ratio={atr_ratio:.2f} — intraday calm, daily HMM lagging"
+                f"ADX_1m={adx_1m:.1f} ADX_5m={adx_5m:.1f} ATR_ratio={atr_ratio:.2f}"
             )
             return REGIME_TRENDING
 
@@ -98,17 +106,97 @@ def intraday_regime_override(row, reg: int) -> int:
     if reg == REGIME_UNCERTAIN:
         adx       = row.get('adx_14', 0)
         iv_change = row.get('iv_pct_change', 0)
-        # Use tf5_ ADX when available — 5-min ADX is more stable than 1-min
         adx5      = row.get('tf5_adx', adx)
-        effective_adx = max(adx, adx5)
-        if effective_adx >= 30 and iv_change < 15:
+        # Require BOTH timeframes to confirm trend — consensus, not max.
+        # max(adx, adx5) could fire when 1m ADX=31 (noise spike) but 5m ADX=22
+        # (ranging). That's not a trend. Require both >= 27 (lower threshold for
+        # the stricter timeframe) AND average >= 30 so the regime flip is real.
+        adx_avg = (adx + adx5) / 2
+        adx_min = min(adx, adx5)
+        # Threshold: avg >= 28, min >= 22.
+        # WHY lowered from (30/27): on Apr 23, ADX dropped from 44 at 11:03 to ~20-25
+        # on 5m within 10 min, while still clearly trending (NIFTY in a sustained move).
+        # adx_min=27 was too strict and caused UNCERTAIN to block valid mid-session signals.
+        # adx_min=22 still requires both TFs to show meaningful trend (not just 1m noise).
+        #
+        # EXCEPTION: when 1m ADX is very strong (>=40), relax min to 18.
+        # Apr 24: 1m ADX=47.5, 5m ADX=21.3 — adx_min=21.3 missed threshold by 0.7.
+        # A 1m ADX of 47 is unambiguously a real trend; the 5m ADX lags by design
+        # (5m candles update every 5 bars). Requiring 5m>=22 when 1m>=40 is over-restrictive.
+        _adx_min_req = 18 if adx >= 40 else 22
+        if adx_avg >= 28 and adx_min >= _adx_min_req and iv_change < 15:
             logger.info(
-                f"[RegimeOverride] UNCERTAIN->TRENDING: ADX_1m={adx:.1f} ADX_5m={adx5:.1f} IV_chg={iv_change:.1f}% "
-                f"— strong intraday trend overrides pending HMM confirmation"
+                f"[RegimeOverride] UNCERTAIN->TRENDING: ADX_1m={adx:.1f} ADX_5m={adx5:.1f} "
+                f"avg={adx_avg:.1f} min={adx_min:.1f} req={_adx_min_req} IV_chg={iv_change:.1f}% "
+                f"— both timeframes confirm trend"
             )
             return REGIME_TRENDING
 
     return reg
+
+
+def compute_session_regime(row) -> tuple:
+    """
+    Intraday session regime detector — authoritative for signal gating.
+
+    Replaces the patchwork of intraday_regime_override rules with a single
+    deterministic score that answers one question: "Is the market currently
+    in a confirmed trend suitable for directional options buying?"
+
+    Returns
+    -------
+    (regime_label: str, score: float)
+        regime_label — 'TRENDING_CONFIRMED' | 'TRENDING_WEAK' | 'RANGING' | 'NO_TRADE'
+        score        — 0.0-1.0, fraction of trend criteria met (for logging)
+
+    Scoring (4 criteria, each worth 1 point):
+        1. ADX (5-min) >= 25: confirmed directional momentum
+        2. ATR ratio  >= 0.88: volatility expanding, not contracting
+        3. BB squeeze == 0:    not in compression
+        4. 3-bar directional consistency (tf5_ret_1 and tf5_ret_3 same sign)
+
+    Thresholds:
+        score >= 3 AND has_direction → TRENDING_CONFIRMED  (entry allowed)
+        score >= 2 AND has_direction → TRENDING_WEAK       (entry blocked)
+        score < 2  OR no direction  → RANGING              (entry blocked)
+        mod < 30 OR mod >= 330 OR IV spike > 20% → NO_TRADE (hard block)
+    """
+    mod = int(row.get('minute_of_day', 0))
+
+    # Hard no-trade zones: opening 30 min (VWAP not stable) and closing 30 min
+    if mod < 30 or mod >= 330:
+        return 'NO_TRADE', 0.0
+
+    # IV spike: market is in shock, spreads wide, direction unpredictable
+    if float(row.get('iv_pct_change', 0)) > 20:
+        return 'NO_TRADE', 0.0
+
+    adx_5m    = float(row.get('tf5_adx', 0))
+    atr_ratio = float(row.get('atr_ratio', 1.0))
+    bb_sq     = int(row.get('bb_squeeze', 0))
+    tf5_ret1  = float(row.get('tf5_ret_1', 0.0))
+    tf5_ret3  = float(row.get('tf5_ret_3', 0.0))
+
+    score = 0
+    if adx_5m >= 25:    score += 1
+    if atr_ratio >= 0.88: score += 1
+    if bb_sq == 0:      score += 1
+
+    # Directional consistency: both short and medium 5m returns point same way
+    trending_up   = tf5_ret1 > 0 and tf5_ret3 > 0
+    trending_down = tf5_ret1 < 0 and tf5_ret3 < 0
+    has_direction = trending_up or trending_down
+    if has_direction:
+        score += 1
+
+    normalised = score / 4.0
+
+    if score >= 3 and has_direction:
+        return 'TRENDING_CONFIRMED', normalised
+    elif score >= 2 and has_direction:
+        return 'TRENDING_WEAK', normalised
+    else:
+        return 'RANGING', normalised
 
 
 class RegimeDetector:
@@ -224,12 +312,13 @@ class RegimeDetector:
                 logger.warning("HMM forward pass failed, falling back to Viterbi (non-causal)")
                 raw_states = self.model.predict(X)
 
+            # mapped uses the same integer positions as idx (the filtered subset).
+            # Align by position: zip dates (all rows) with mapped values directly.
             mapped = pd.Series([self.state_map[s] for s in raw_states], index=idx)
             dates  = df1d['datetime'].dt.date.values
             regime_by_date = {}
-            for row_i, date_ in enumerate(dates):
-                if row_i in mapped.index:
-                    regime_by_date[date_] = int(mapped[row_i])
+            for pos, regime_val in zip(idx, mapped.values):
+                regime_by_date[dates[pos]] = int(regime_val)
             return pd.Series(regime_by_date)
         else:
             # Rule-based fallback using vol + ADX
@@ -341,7 +430,7 @@ class RegimeStateMachine:
 
     def __init__(self):
         self.current_regime    : int   = REGIME_RANGING
-        self.regime_bar_count  : int   = 0   # how long we've been in current regime
+        self.regime_bar_count  : int   = MIN_REGIME_DURATION[REGIME_RANGING]  # pre-fill so first flip can occur immediately
         self.pending_regime    : int   = -1
         self.pending_count     : int   = 0
         self._flip_bar         : int   = 0   # bar index when last flip occurred

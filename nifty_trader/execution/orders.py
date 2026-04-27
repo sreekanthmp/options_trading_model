@@ -30,12 +30,13 @@ if TYPE_CHECKING:
 from ..config import (
     LOT_SIZE, LOT_SIZE_OLD, LOT_SIZE_NEW, LOT_SIZE_CUTOVER,
     STRIKE_OFFSET_CE, STRIKE_OFFSET_PE, STRIKE_ROUNDING,
-    MAX_RISK_PCT, STOP_LOSS_PCT, TARGET_PCT,
+    MAX_RISK_PCT, CAPITAL_DEPLOY_PCT, MAX_CONTRACTS, STOP_LOSS_PCT, TARGET_PCT, CONF_SIZE_BANDS,
     COST_RT_PCT, SLIPPAGE_PCT, THETA_DECAY_PCT, TOTAL_COST_PCT,
     DELTA_BASE, THETA_PTS_PER_BAR, HORIZONS,
-    LIMIT_BUY_BUFFER_PCT, LIMIT_SELL_BUFFER_PCT,
+    LIMIT_BUY_BUFFER_PCT, LIMIT_BUY_BUFFER_PTS, LIMIT_SELL_BUFFER_PCT,
     LIMIT_FILL_PROB_ATM, LIMIT_FILL_PROB_EXPIRY, LIMIT_FILL_PROB_HIGH_IV,
     LIMIT_SPREAD_NORMAL_PCT, LIMIT_SPREAD_HIGH_IV_PCT,
+    EXPIRY_ZONES, EXPIRY_CONF_FLOOR, EXPIRY_IV_BLOCK_PCT,
 )
 from ..utils.safeguards import safe_value, check_lpp_violation, get_max_oi_strikes, avoid_oi_concentration_zone
 from .costs import effective_cost, get_dynamic_theta
@@ -66,12 +67,11 @@ def display_option_predictions(signal: dict, verbose: bool = False) -> None:
     overall_conf = signal.get('avg_conf', 0) * 100
     
     print("\n" + "="*88)
-    print(f"  ACTIONABLE OPTIONS STRATEGY (Spot: ₹{spot:.2f})")
+    print(f"  ACTIONABLE OPTIONS STRATEGY (Spot: Rs {spot:.2f})")
     print("="*88)
     print(f"  Overall Signal: {direction} with {overall_conf:.1f}% confidence")
-    # CE strike = spot + 100 (OTM call), PE strike = spot - 100 (OTM put)
-    ce_label = "OTM" if strike_ce > spot else "ITM"
-    pe_label = "OTM" if strike_pe < spot else "ITM"
+    ce_label = "ITM" if strike_ce < spot else ("ATM" if strike_ce == spot else "OTM")
+    pe_label = "ITM" if strike_pe > spot else ("ATM" if strike_pe == spot else "OTM")
     print(f"\n  Available Strikes:")
     print(f"    CE {strike_ce} ({ce_label}) → Current LTP: Rs {ce_ltp:.2f}")
     print(f"    PE {strike_pe} ({pe_label}) → Current LTP: Rs {pe_ltp:.2f}")
@@ -97,7 +97,7 @@ def display_option_predictions(signal: dict, verbose: bool = False) -> None:
             current_ltp = ce_ltp
             target_ltp = proj.get('ce_net_ltp', 0)
             exp_pnl_pct = proj.get('ce_pnl_pct', 0)
-            action = f"BUY {option_type} 📈"
+            action = f"BUY {option_type} ^"
         else:
             # Bearish - recommend PE
             option_type = "PE"
@@ -105,11 +105,11 @@ def display_option_predictions(signal: dict, verbose: bool = False) -> None:
             current_ltp = pe_ltp
             target_ltp = proj.get('pe_net_ltp', 0)
             exp_pnl_pct = proj.get('pe_pnl_pct', 0)
-            action = f"BUY {option_type} 📉"
+            action = f"BUY {option_type} v"
         
         # Format display
         strike_display = f"{option_type} {strike_used}"
-        target_display = f"₹{target_ltp:.2f}"
+        target_display = f"Rs{target_ltp:.2f}"
         conf_display = f"{h_conf:.1f}%"
         pnl_display = f"{'+' if exp_pnl_pct > 0 else ''}{exp_pnl_pct:.2f}%"
         
@@ -136,18 +136,18 @@ def display_option_predictions(signal: dict, verbose: bool = False) -> None:
             print(f"    Projected Spot: {spot:.2f} → {proj.get('proj_spot', 0):.2f}")
             print(f"    DTE Remaining: {proj.get('dte_proj', 0):.1f} minutes")
             print(f"\n    CE {strike_ce}:")
-            print(f"      Current LTP: ₹{ce_ltp:.2f}")
-            print(f"      Projected LTP (before slip): ₹{proj.get('ce_ltp_proj', 0):.2f}")
-            print(f"      Net LTP (after 3% slip): ₹{proj.get('ce_net_ltp', 0):.2f}")
+            print(f"      Current LTP: Rs{ce_ltp:.2f}")
+            print(f"      Projected LTP (before slip): Rs{proj.get('ce_ltp_proj', 0):.2f}")
+            print(f"      Net LTP (after 3% slip): Rs{proj.get('ce_net_ltp', 0):.2f}")
             print(f"      Expected P&L: {proj.get('ce_pnl_pct', 0):+.2f}%")
             print(f"\n    PE {strike_pe}:")
-            print(f"      Current LTP: ₹{pe_ltp:.2f}")
-            print(f"      Projected LTP (before slip): ₹{proj.get('pe_ltp_proj', 0):.2f}")
-            print(f"      Net LTP (after 3% slip): ₹{proj.get('pe_net_ltp', 0):.2f}")
+            print(f"      Current LTP: Rs{pe_ltp:.2f}")
+            print(f"      Projected LTP (before slip): Rs{proj.get('pe_ltp_proj', 0):.2f}")
+            print(f"      Net LTP (after 3% slip): Rs{proj.get('pe_net_ltp', 0):.2f}")
             print(f"      Expected P&L: {proj.get('pe_pnl_pct', 0):+.2f}%")
         print("="*88)
     
-    print("\n  ⚠️  WARNING: Predictions based on ML models + simplified option pricing.")
+    print("\n  WARNING: Predictions based on ML models + simplified option pricing.")
     print("     Real option prices depend on IV, gamma, vega. Use for direction guidance only.")
     print("="*88 + "\n")
 
@@ -203,7 +203,7 @@ def _next_expiry_mins(now=None) -> float:
         open_mins  = OPEN_HM.hour * 60 + OPEN_HM.minute
         close_mins = CLOSE_HM.hour * 60 + CLOSE_HM.minute
         cur_mins   = t.hour * 60 + t.minute
-        return max(0.0, min(close_mins, close_mins) - max(open_mins, cur_mins))
+        return max(0.0, close_mins - max(open_mins, cur_mins))
 
     # Determine expiry date
     try:
@@ -309,6 +309,13 @@ def estimate_option_premium(spot: float, iv_annualised_pct: float,
     else:
         price = strike * np.exp(-r * T) * _norm.cdf(-d2) - spot * _norm.cdf(-d1)
 
+    # Sanity check: option premium shouldn't exceed spot price (CE) or strike (PE)
+    max_reasonable = spot if option_type == 'CE' else strike
+    if price > max_reasonable * 0.5:  # Flag if premium > 50% of underlying
+        logger.warning(f"[BS Pricing] Extreme premium {price:.2f} for {option_type} {strike} "
+                      f"(spot={spot:.2f}, IV={iv_annualised_pct:.1f}%, DTE={dte_mins:.0f}min)")
+        price = min(price, max_reasonable * 0.5)  # Cap at 50% of underlying
+    
     return max(float(price), 2.0)
 
 
@@ -488,7 +495,7 @@ def adjust_conf_for_flow(base_conf: float, fii_net: float, direction: str) -> fl
     """
     Reduce confidence if trading AGAINST strong institutional flow.
     
-    WHY: FII selling >₹2000 Cr/day often precedes 2-3 day declines.
+    WHY: FII selling >Rs2000 Cr/day often precedes 2-3 day declines.
          Trading against this flow reduces edge.
     
     Args:
@@ -515,29 +522,69 @@ def adjust_conf_for_flow(base_conf: float, fii_net: float, direction: str) -> fl
 # EXPIRY-DAY HARD RULES
 # ==============================================================================
 
-EXPIRY_RULES = {
-    # (minute_of_day range): {'allow_new': bool, 'size_mult': float, 'stop_tighten': float}
-    'pre_1130':    {'allow_new': True,  'size_mult': 0.50, 'stop_tighten': 0.70},
-    '1130_to_1300':{'allow_new': False, 'size_mult': 0.25, 'stop_tighten': 0.50},
-    'after_1300':  {'allow_new': False, 'size_mult': 0.00, 'stop_tighten': 0.00},
-}
-
 def get_expiry_rule(is_expiry: bool, minute_of_day: int) -> dict:
-    """Return the applicable expiry-day rule for the current time."""
+    """Return the applicable expiry-day rule for the current minute_of_day.
+
+    On a normal (non-expiry) day returns full-size, normal-stop rule.
+
+    On expiry day (Tuesday), NIFTY weekly options are subject to extreme gamma
+    and rapidly accelerating theta.  The session is divided into four zones:
+
+      Zone 1  09:15-11:29  (mod   0-134) — moderate gamma, half-size, 3.5% stop
+      Zone 2  11:30-12:59  (mod 135-224) — max-pain pinning, block new entries
+      Zone 3  13:00-14:49  (mod 225-334) — pin-break gamma surge, quarter-size, 2.5% stop
+      Zone 4  14:50+       (mod 335+)    — extreme gamma, block all entries
+
+    Returns dict with:
+        allow_new    : bool  — whether a new entry is permitted right now
+        size_mult    : float — multiplier on contracts from select_option()
+        stop_tighten : float — multiplier on STOP_LOSS_PCT
+        tag          : str   — human-readable zone label for logging
+    """
     if not is_expiry:
-        return {'allow_new': True, 'size_mult': 1.0, 'stop_tighten': 1.0}
-    if minute_of_day >= 225:   # 13:00 = 9:15 + 225 min  → no new entries after 13:00
-        return {'allow_new': False, 'size_mult': 0.0,  'stop_tighten': 0.0,  'tag': 'EXPIRY_AFTER_1300'}
-    if minute_of_day >= 135:   # 11:30 = 9:15 + 135 min  → block 11:30–13:00
-        return {'allow_new': False, 'size_mult': 0.25, 'stop_tighten': 0.50, 'tag': 'EXPIRY_1130_1300'}
-    return {'allow_new': True, 'size_mult': 0.50, 'stop_tighten': 0.70, 'tag': 'EXPIRY_PRE_1130'}
+        return {'allow_new': True, 'size_mult': 1.0, 'stop_tighten': 1.0, 'tag': 'NORMAL'}
+
+    for zone_name, z in EXPIRY_ZONES.items():
+        if z['mod_start'] <= minute_of_day <= z['mod_end']:
+            tag_map = {
+                'zone1': 'EXPIRY_ZONE1_HALF_SIZE',
+                'zone2': 'EXPIRY_ZONE2_PINNING_BLOCK',
+                'zone3': 'EXPIRY_ZONE3_PINBREAK_QTR',
+                'zone4': 'EXPIRY_ZONE4_GAMMA_BLOCK',
+            }
+            return {
+                'allow_new':    z['allow_new'],
+                'size_mult':    z['size_mult'],
+                'stop_tighten': z['stop_tighten'],
+                'tag':          tag_map.get(zone_name, zone_name),
+            }
+
+    # Fallback (should never hit — zone4 covers 335+)
+    return {'allow_new': False, 'size_mult': 0.0, 'stop_tighten': 0.0, 'tag': 'EXPIRY_UNKNOWN_ZONE'}
+
+
+def check_expiry_iv_block(is_expiry: bool, iv_annpct: float) -> tuple:
+    """Block entries on expiry day when IV spikes above EXPIRY_IV_BLOCK_PCT.
+
+    On expiry day, IV can double intraday (from ~12% to 25%+) when NIFTY
+    approaches a key strike.  Buying options at this point means paying 2x
+    premium that will collapse immediately once the strike is cleared.
+
+    Returns (blocked: bool, reason: str).
+    """
+    if not is_expiry:
+        return False, ''
+    if iv_annpct > EXPIRY_IV_BLOCK_PCT:
+        return True, (f'EXPIRY_IV_SPIKE: annualised IV {iv_annpct:.1f}% > '
+                      f'{EXPIRY_IV_BLOCK_PCT:.0f}% threshold on expiry day')
+    return False, ''
 
 
 # ==============================================================================
 # VEGA-AWARE ENTRY FILTER
 # ==============================================================================
 
-def vega_entry_filter(iv_rank: float, iv_pct_change_today: float) -> tuple:
+def vega_entry_filter(iv_proxy: float, iv_pct_change_today: float) -> tuple:
     """
     Block entries when IV is already elevated or has just spiked.
 
@@ -545,20 +592,28 @@ def vega_entry_filter(iv_rank: float, iv_pct_change_today: float) -> tuple:
     will compress even if the directional call is correct.  This is the single
     largest source of "correct direction, lost money" outcomes in options.
 
+    Uses iv_proxy (absolute annualised %) instead of iv_rank percentile —
+    iv_rank breaks post-crash when calm days falsely rank at 5th percentile.
+
+    Thresholds (annualised iv_proxy %):
+      > 1.5%: block — extreme vol, premium overpriced, crush risk high
+      > 1.0%: warn  — tighter stops recommended
+
     Returns (allow: bool, reason: str)
     """
-    if iv_rank > 80:
-        return False, f"VEGA_FILTER: IV rank {iv_rank:.0f} too elevated (>80)"
+    if iv_proxy > 1.5:
+        return False, f"VEGA_FILTER: iv_proxy={iv_proxy:.2f}% too elevated (>1.5%) — crush risk"
     if iv_pct_change_today > 20:
         return False, f"VEGA_FILTER: IV spiked {iv_pct_change_today:.0f}% today — crush risk"
-    if iv_rank > 65:
-        logger.info(f"[Vega] IV rank {iv_rank:.0f} above median — tighter stops recommended")
+    if iv_proxy > 1.0:
+        logger.info(f"[Vega] iv_proxy={iv_proxy:.2f}% elevated — tighter stops recommended")
     return True, ''
 
 
 def simulate_limit_order(mid_price: float, side: str,
                          is_expiry: bool = False,
                          iv_rank: float = 50.0,
+                         iv_proxy: float = 0.0,
                          rng: np.random.Generator = None) -> dict:
     """
     Simulate a LIMIT order fill — mirrors SEBI April 2026 rules (no MARKET orders).
@@ -579,7 +634,9 @@ def simulate_limit_order(mid_price: float, side: str,
     is_expiry : bool
         Whether today is expiry day (lower fill prob, wider spreads)
     iv_rank : float
-        Current IV rank 0-100 (higher = wider spreads, lower fill prob)
+        Kept for backward compatibility (unused — replaced by iv_proxy)
+    iv_proxy : float
+        Current iv_proxy (daily annualised %). >1.2% = high IV, wider spreads.
     rng : np.random.Generator
         Optional seeded RNG for reproducibility in backtests
 
@@ -597,7 +654,7 @@ def simulate_limit_order(mid_price: float, side: str,
     if rng is None:
         rng = np.random.default_rng()
 
-    high_iv = iv_rank > 70
+    high_iv = iv_proxy > 1.2  # absolute threshold — not relative iv_rank percentile
 
     # 1. Determine fill probability
     if is_expiry:
@@ -612,8 +669,12 @@ def simulate_limit_order(mid_price: float, side: str,
 
     # 3. Compute limit price
     if side == 'BUY':
-        # Submit limit at mid + buy_buffer (willing to pay up to this)
-        limit_price = mid_price * (1.0 + LIMIT_BUY_BUFFER_PCT + spread_pct)
+        # Use the larger of a fixed Rs buffer or a percentage buffer.
+        # Rs 1.5 fixed dominates for ATM options (Rs 100-400 LTP) where the real
+        # bid-ask spread is 1-3 Rs; the 0.3% pct would only be 0.3-1.2 Rs — too tight.
+        pct_buf = mid_price * (LIMIT_BUY_BUFFER_PCT + spread_pct)
+        pts_buf = LIMIT_BUY_BUFFER_PTS + mid_price * spread_pct
+        limit_price = mid_price + max(pct_buf, pts_buf)
     else:  # SELL
         # Submit limit at mid - sell_buffer (willing to accept down to this)
         limit_price = mid_price * (1.0 - LIMIT_SELL_BUFFER_PCT - spread_pct)
@@ -658,7 +719,7 @@ def simulate_limit_order(mid_price: float, side: str,
 
 def select_option(signal: dict, capital: float, now=None, tick_buffer=None,
                  session: 'AngelSession' = None, position_mgr: 'PositionManager' = None,
-                 rng: np.random.Generator = None) -> dict:
+                 rng: np.random.Generator = None, crisis_bypass: bool = False) -> dict:
     """Strike selection and position sizing.
 
     LIVE-SAFE redesign:
@@ -706,33 +767,29 @@ def select_option(signal: dict, capital: float, now=None, tick_buffer=None,
     atm           = round(spot / 50) * 50
     option_type   = 'CE' if direction == 'UP' else 'PE'
 
-    # Regime-adaptive strike selection
-    # WHY: In strong trending regimes, slight ITM reduces theta risk and
-    # gives higher delta (more directional exposure per rupee spent).
-    # In ranging/crisis, ATM gives better gamma for mean-reversion pops.
-    # Rule:
-    #   TRENDING + BREAKOUT micro → ITM by 1 strike (50pts in direction)
-    #   Everything else           → ATM
-    micro_regime_sig = signal.get('micro_regime', '')
-    regime_sig       = signal.get('regime', '')
-    is_strong_trend  = (
-        str(regime_sig) == '0'   # REGIME_TRENDING = 0
-        and micro_regime_sig in ('TRENDING_UP', 'TRENDING_DN', 'BREAKOUT')
-    )
-    if is_strong_trend:
-        # ITM: CE → strike below spot, PE → strike above spot
-        strike = atm - 50 if direction == 'UP' else atm + 50
+    # Strike selection: always ITM by STRIKE_OFFSET_CE / STRIKE_OFFSET_PE (config).
+    # Negative CE offset = below spot = ITM call; positive PE offset = above spot = ITM put.
+    # This reduces theta drag vs ATM while retaining sufficient liquidity.
+    if direction == 'UP':
+        strike = atm + STRIKE_OFFSET_CE   # e.g. atm - 50 → 1-strike ITM call
     else:
-        strike = atm
+        strike = atm + STRIKE_OFFSET_PE   # e.g. atm + 50 → 1-strike ITM put
 
     # ---- 1. Expiry-day hard rules -------------------------------------------
     expiry_rule = get_expiry_rule(is_expiry, minute_of_day)
     if not expiry_rule['allow_new']:
-        logger.warning(f"[Expiry] New entries blocked — {expiry_rule.get('tag', 'expiry rule')}")
+        logger.warning(f"[Expiry] New entries blocked — {expiry_rule['tag']} "
+                       f"(mod={minute_of_day})")
+        return None
+
+    # ---- 1b. Expiry-day IV spike block --------------------------------------
+    iv_blocked, iv_block_reason = check_expiry_iv_block(is_expiry, iv_annpct)
+    if iv_blocked:
+        logger.warning(f"[Expiry] {iv_block_reason}")
         return None
 
     # ---- 2. Vega-aware entry filter ------------------------------------------
-    vega_ok, vega_reason = vega_entry_filter(iv_rank, iv_pct_chg)
+    vega_ok, vega_reason = vega_entry_filter(_iv_daily, iv_pct_chg)
     if not vega_ok:
         logger.warning(f"[VegaFilter] {vega_reason}")
         return None
@@ -751,24 +808,64 @@ def select_option(signal: dict, capital: float, now=None, tick_buffer=None,
             return None
 
     # ---- 5. Premium estimation -----------------------------------------------
-    # In live mode, Angel One injects the real market LTP into the signal under
-    # the key 'ce_ltp_api' / 'pe_ltp_api' (set only when fetched from the live
-    # option chain — NOT the BS estimate injected by replay/signal_generator).
-    # 'ce_ltp_current' / 'pe_ltp_current' in the signal are rolling-ATM BS
-    # estimates and may be at a different strike than the one selected here.
-    # Always recompute at the exact selected strike using BS.
-    # Live mode overrides this by passing 'ce_ltp_api' / 'pe_ltp_api'.
+    # Priority: fetch real LTP from Angel One for the exact selected strike.
+    # This ensures entry price reflects the actual market price at signal time,
+    # not a BS estimate or a pre-fetched ATM LTP that may be for a different strike.
+    # Falls back to BS if session is unavailable (paper/backtest without API).
     dte_mins_entry = _next_expiry_mins(now)
-    api_ltp_key = 'ce_ltp_api' if option_type == 'CE' else 'pe_ltp_api'
-    api_ltp     = float(signal.get(api_ltp_key, 0.0))
-    if api_ltp > 1.0:
-        est_premium = api_ltp   # real Angel One market price — use as-is
+    lot_size  = get_lot_size(now)
+
+    def _get_ltp_for_strike(s: int) -> float:
+        """Return real LTP for strike s if session available, else 0. Always bypasses cache."""
+        if session is not None:
+            try:
+                from ..data.external_data import fetch_option_ltp as _fol
+                ltp = _fol(session, s, option_type, force_fresh=True)
+                if ltp > 1.0:
+                    return ltp
+            except Exception as _e:
+                logger.warning(f"[select_option] fetch_option_ltp({s}) failed: {_e}")
+        return 0.0
+
+    _real_ltp = _get_ltp_for_strike(strike)
+    if _real_ltp > 1.0:
+        est_premium = _real_ltp
+        logger.info(f"[select_option] Using real LTP {_real_ltp:.2f} for {option_type} {strike} (not BS estimate)")
     else:
-        est_premium = estimate_option_premium(
-            spot, iv_annpct, dte_mins_entry,
-            strike=float(strike), option_type=option_type
+        # Fallback: signal may carry pre-fetched ATM LTP (same strike case only)
+        api_ltp_key = 'ce_ltp_api' if option_type == 'CE' else 'pe_ltp_api'
+        api_ltp     = float(signal.get(api_ltp_key, 0.0))
+        if api_ltp > 1.0:
+            est_premium = api_ltp
+        else:
+            est_premium = estimate_option_premium(
+                spot, iv_annpct, dte_mins_entry,
+                strike=float(strike), option_type=option_type
+            )
+    est_premium = max(est_premium, 5)   # absolute floor (sanity guard only)
+
+    # ---- 5a. Capital affordability check — ATM only, no OTM fallback ----------
+    # Only trade ATM (or ITM in strong-trend regime). Never walk OTM.
+    # If the selected strike costs more than capital for 1 lot, block the trade.
+    _lot_cost = est_premium * lot_size
+    if _lot_cost > capital:
+        logger.warning(
+            f"[Capital] Cannot afford 1 lot: {option_type} {strike} costs "
+            f"Rs {est_premium:.1f} x {lot_size} = Rs {_lot_cost:.0f} > "
+            f"capital Rs {capital:.0f}. Trade blocked — no OTM fallback."
         )
-    est_premium = max(est_premium, 5)
+        return None
+
+    # Minimum premium guard: options with premium < Rs 30 have bid-ask spreads
+    # that are 5-15% of premium — making it impossible to profit after round-trip costs.
+    # Trade #21 (Rs 126 premium walked OTM to ~Rs 80) shows the real risk here.
+    _min_premium_floor = 30.0
+    if est_premium < _min_premium_floor:
+        logger.warning(
+            f"[PremiumFloor] est_premium=Rs {est_premium:.1f} < Rs {_min_premium_floor:.0f} "
+            f"minimum. Spread cost destroys edge on cheap OTM options. Trade blocked."
+        )
+        return None
 
     # ---- 5b. Bid-ask spread validation ----------------------------------------
     # If live bid/ask are available in the signal (from option chain feed), check
@@ -792,30 +889,33 @@ def select_option(signal: dict, capital: float, now=None, tick_buffer=None,
     # ---- 6. LIMIT order simulation (replaces fixed slippage model) -----------
     # SEBI April 2026: MARKET orders banned for algos. Paper trading now
     # simulates a LIMIT BUY at LTP + buffer, with realistic fill probability.
+    # CRISIS bypass: ATM options in a strong trending CRISIS move have normal
+    # liquidity — use ATM fill probability (97%) not expiry (88%) to avoid
+    # penalizing the highest-conviction signals with random misses.
     expiry_cost_mult = 2.0 if is_expiry and minute_of_day > 135 else 1.0
     limit_sim = simulate_limit_order(
         mid_price  = est_premium,
         side       = 'BUY',
-        is_expiry  = is_expiry,
-        iv_rank    = iv_rank,
+        is_expiry  = is_expiry and not crisis_bypass,
+        iv_proxy   = _iv_daily,
         rng        = rng,
     )
     if not limit_sim['filled']:
         logger.info(
             f"[LimitOrder] ENTRY unfilled — fill_prob={limit_sim['fill_prob']:.0%} "
-            f"limit={limit_sim['limit_price']:.2f}  iv_rank={iv_rank:.0f}"
+            f"limit={limit_sim['limit_price']:.2f}  iv_proxy={_iv_daily:.2f}"
         )
         return None   # Missed fill — same behaviour as a real unexecuted LIMIT order
 
     entry_price   = limit_sim['fill_price']
-    effective_cost = COST_RT_PCT * expiry_cost_mult   # brokerage + taxes only (no slippage — captured above)
+    cost_rt_adj = COST_RT_PCT * expiry_cost_mult   # brokerage + taxes only (no slippage — captured above)
 
     # ---- 7. PREMIUM-BASED stop loss (not underlying-based) -------------------
     # Stop is expressed as % of the option PREMIUM paid.
     # This fires on the option's own price, not on the underlying move.
     # Key advantage: immune to IV distortion, gap risk, and basis drift.
     premium_stop_pct = STOP_LOSS_PCT * expiry_rule['stop_tighten']
-    if iv_rank > 65:
+    if _iv_daily > 1.3:
         premium_stop_pct *= 0.80   # tighter stop when IV elevated (faster adverse moves)
     stop_price = entry_price * (1 - premium_stop_pct)
 
@@ -840,42 +940,120 @@ def select_option(signal: dict, capital: float, now=None, tick_buffer=None,
         delta_raw = 0.50 + sharpness * (1.0 - moneyness)
     delta_entry = float(np.clip(delta_raw, 0.10, 0.90))
 
-    # Risk amount the model is willing to lose per trade
-    risk_amt = capital * MAX_RISK_PCT
-    # Premium risk per lot = entry_price * stop_pct * lot_size
-    lot_size  = get_lot_size(now)
-    premium_risk_per_lot = entry_price * premium_stop_pct * lot_size
+    # Capital-deploy based lot sizing:
+    # Use CAPITAL_DEPLOY_PCT % of capital as premium budget.
+    # Lots = floor(budget / cost_per_lot)
+    # Example: Rs 30,000 × 100% / (217 × 65) = 2 lots
+    deploy_budget = capital * CAPITAL_DEPLOY_PCT
+    cost_per_lot  = entry_price * lot_size
 
-    # Delta normalization: a higher-delta option carries more underlying exposure
-    # per lot.  Reduce lot count proportionally so underlying exposure stays stable.
-    delta_norm_factor = min(1.0, 0.50 / max(delta_entry, 0.10))  # normalize to ATM=0.5 baseline
-
-    # IV rank spread penalty (wide spreads = impact cost)
+    # Always use 100% of capital — spread cost captured in limit order simulation.
     spread_penalty = 1.0
-    if iv_rank > 85:
-        spread_penalty = 0.33
-        logger.info(f"[Sizing] Extreme IV rank {iv_rank:.0f} -> position 33%")
-    elif iv_rank > 70:
-        spread_penalty = 0.50
-        logger.info(f"[Sizing] High IV rank {iv_rank:.0f} -> position 50%")
 
     # Expiry size multiplier
     expiry_size_mult = expiry_rule['size_mult']
 
-    raw_contracts = risk_amt / (premium_risk_per_lot + 1e-9)
-    contracts = int(raw_contracts * delta_norm_factor * spread_penalty * expiry_size_mult)
-    contracts = max(1, min(contracts, 5))
+    raw_contracts = (deploy_budget * spread_penalty * expiry_size_mult) / (cost_per_lot + 1e-9)
+
+    # Dynamic sizing layer:
+    # affordability gives the base lot count; confidence, drawdown, volatility,
+    # and regime decide how much of that capacity the trade deserves.
+    # --- Dynamic sizing multipliers (all <= 1.0 — reduce from base, never boost) ---
+    # CAPITAL_DEPLOY_PCT=0.75 leaves 25% headroom so full-confidence trades reach
+    # the affordable maximum without any multiplier exceeding 1.0.
+    conf = float(signal.get('final_conf', signal.get('avg_conf', 0.5)))
+    conf_mult = 0.50   # default: minimum size for below-floor signals
+    for _floor, _frac in CONF_SIZE_BANDS:
+        if conf >= _floor:
+            conf_mult = _frac
+            break
+
+    # Drawdown multiplier from KillSwitch (already tracks consecutive losses etc.)
+    dd_mult = 1.0
+    if position_mgr is not None and hasattr(position_mgr, 'get_position_size_multiplier'):
+        try:
+            dd_mult = float(position_mgr.get_position_size_multiplier())
+        except Exception as exc:
+            logger.debug(f"[SizingV2] drawdown multiplier unavailable: {exc}")
+
+    # Volatility scaling: high IV means wide spreads and premium crush risk.
+    if _iv_daily > 1.2:
+        vol_mult = 0.70
+    else:
+        vol_mult = 1.00   # no boost in low-IV — raw_contracts already captures budget
+
+    # Regime scaling: reduce in RANGING (choppy, mean-reverting).
+    regime = signal.get('regime')
+    regime_key = str(regime).upper()
+    if regime_key in ("RANGING", "1") or regime == 1:
+        regime_mult = 0.70
+    else:
+        regime_mult = 1.00   # TRENDING and UNCERTAIN: no reduction
+
+    # Soft drawdown throttle — uses week-to-date equity, not intraday.
+    # day_start_equity resets each morning, so it can't detect multi-day loss streaks.
+    # _week_start_equity persists across days — catches the "3 bad days in a row" scenario
+    # where each morning looks fine but the week-to-date hole is already deep.
+    soft_dd_mult = 1.0
+    if position_mgr is not None:
+        _week_start = getattr(position_mgr, '_week_start_equity', None)
+        _cur_eq     = getattr(position_mgr, 'current_equity', None)
+        if _week_start is not None and _cur_eq is not None and float(_week_start) > 0:
+            _wtd_dd = (float(_week_start) - float(_cur_eq)) / (float(_week_start) + 1e-9)
+            if _wtd_dd > 0.08:
+                soft_dd_mult = 0.5   # >8% WTD loss: half size
+            elif _wtd_dd > 0.04:
+                soft_dd_mult = 0.7   # >4% WTD loss: reduced size
+
+    composite_mult = conf_mult * dd_mult * vol_mult * regime_mult * soft_dd_mult
+    scaled_contracts = raw_contracts * composite_mult
+    contracts = max(1, min(int(scaled_contracts), MAX_CONTRACTS))
+
+    logger.info(
+        f"[SizingV2] conf={conf:.2f} conf_mult={conf_mult:.2f} "
+        f"dd_mult={dd_mult:.2f} vol_mult={vol_mult:.2f} "
+        f"regime_mult={regime_mult:.2f} soft_dd_mult={soft_dd_mult:.2f} "
+        f"composite={composite_mult:.2f} → contracts={contracts}"
+    )
+
+    # Per-trade risk cap: ensure stop-loss exposure stays within MAX_RISK_PCT of capital.
+    # Max risk per lot = entry_price × STOP_LOSS_PCT × lot_size
+    # Max affordable lots = (capital × MAX_RISK_PCT) / max_risk_per_lot
+    # This is the SL-based sizing floor — it can only REDUCE contracts, never increase them.
+    # WHY: the capital-budget method above sizes by how much premium we can afford to buy;
+    # the risk-cap below asks how many lots we can lose the stop on and stay within 1%.
+    # On cheap options (Rs 50 ATM) the budget method gives 3L but risking 10% on 3L =
+    # Rs 50 × 0.10 × 65 × 3 = Rs 975 which is already under 1% on Rs 1L capital — fine.
+    # On expensive options (Rs 300 ATM, 1L capital) budget gives 1L but risk = Rs 1,950
+    # which is 1.95% — the cap corrects this back to 1L (already min, so no change here).
+    # The cap is most meaningful when MAX_CONTRACTS is raised or capital is small.
+    _risk_per_lot = entry_price * STOP_LOSS_PCT * lot_size
+    if _risk_per_lot > 0:
+        _risk_cap_contracts = int((capital * MAX_RISK_PCT) / _risk_per_lot)
+        _risk_cap_contracts = max(1, _risk_cap_contracts)   # always allow at least 1 lot
+        if _risk_cap_contracts < contracts:
+            logger.info(
+                f"[Sizing] risk-cap: {contracts}L → {_risk_cap_contracts}L "
+                f"(risk/lot=Rs{_risk_per_lot:.0f} > 1% of Rs{capital:.0f}={capital*MAX_RISK_PCT:.0f})"
+            )
+            contracts = _risk_cap_contracts
+            position_value = cost_per_lot * contracts
+
+    logger.info(f"[Sizing] budget=Rs{deploy_budget:.0f} cost/lot=Rs{cost_per_lot:.0f} "
+                f"raw={raw_contracts:.2f} risk_cap={_risk_cap_contracts if _risk_per_lot > 0 else 'n/a'} "
+                f"-> {contracts} lot(s)")
 
     # ---- 9. Position concentration check ------------------------------------
     if position_mgr is not None:
-        position_value = entry_price * lot_size * contracts
-        can_add, reason = position_mgr.can_add_position(position_value)
-        if not can_add:
-            logger.warning(f"[PositionMgr] {reason}")
-            return None
+        _position_value = entry_price * lot_size * contracts
+        if hasattr(position_mgr, 'can_add_position'):
+            can_add, reason = position_mgr.can_add_position(_position_value)
+            if not can_add:
+                logger.warning(f"[PositionMgr] {reason}")
+                return None
 
     # ---- 10. Target price ---------------------------------------------------
-    breakeven    = entry_price * (1 + effective_cost)
+    breakeven    = entry_price * (1 + cost_rt_adj)
     target_price = max(entry_price * (1 + TARGET_PCT), breakeven * 1.10)
 
     gamma_window = is_expiry and minute_of_day > 300
@@ -896,12 +1074,13 @@ def select_option(signal: dict, capital: float, now=None, tick_buffer=None,
         'breakeven':        round(breakeven, 2),
         'notional':         round(entry_price * contracts * lot_size, 2),
         'max_risk':         round(entry_price * premium_stop_pct * contracts * lot_size, 2),
-        'total_cost_pct':   round(effective_cost * 100, 1),
+        'total_cost_pct':   round(cost_rt_adj * 100, 1),
         'gamma_protected':  gamma_window,
         'dte_mins_entry':   round(dte_mins_entry, 1),
         'iv_annpct_entry':  round(iv_annpct, 4),
         'spread_penalty':   round(spread_penalty, 2),
-        'iv_rank':          round(iv_rank, 1),
+        'iv_rank':          round(iv_rank, 1),   # kept for logging/backcompat
+        'iv_proxy':         round(_iv_daily, 4),
         'delta_entry':      round(delta_entry, 3),
         'expiry_rule_tag':  expiry_rule.get('tag', 'NORMAL'),
         # LIMIT order execution details (for paper trade analysis)

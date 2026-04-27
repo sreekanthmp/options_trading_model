@@ -56,7 +56,7 @@ class MetaLabeler:
         vwap_dev_vel, pressure_ratio, bb_squeeze
     """
 
-    META_CONF_THRESH = 0.55   # min meta-model probability to accept a trade
+    META_CONF_THRESH = 0.50   # relaxed: accept any meta-labeler majority
     META_FEATURES = [
         'proba_primary', 'regime', 'session_pct', 'iv_proxy',
         'atr_14_pct', 'adx_14', 'dmi_diff',
@@ -137,10 +137,10 @@ class MetaLabeler:
                       regime: int) -> float:
         """
         Returns probability that primary model is correct for this signal.
-        Returns 1.0 (always accept) if not fitted.
+        Returns 0.55 (neutral pass) if not fitted or on error.
         """
         if not self._fitted or self.model is None:
-            return 1.0
+            return 0.55  # exactly at threshold: meta-labeler not fitted, don't block but don't boost
 
         parts = [np.array([[proba_primary]]),
                  np.array([[float(regime)]])]
@@ -155,7 +155,7 @@ class MetaLabeler:
             p = self.model.predict_proba(Xmeta)[0]
             return float(p[1])   # probability that primary is correct
         except Exception:
-            return 1.0
+            return 0.55  # exactly at threshold: prediction error, don't block but don't boost
 
     def save(self, path: str):
         joblib.dump({'model': self.model, 'fitted': self._fitted}, path)

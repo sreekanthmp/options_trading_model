@@ -99,7 +99,8 @@ def print_live_dashboard(row: pd.Series, analysis: dict,
                           micro_regime: str = 'UNKNOWN',
                           ks_blocked: bool = False,
                           ks_reason: str = '',
-                          streaming: bool = False):
+                          streaming: bool = False,
+                          block_reason: str = ''):
     """Full per-minute analysis dashboard printed to terminal."""
     W = 72
     SEP  = "=" * W
@@ -282,24 +283,11 @@ def print_live_dashboard(row: pd.Series, analysis: dict,
 
     # --- SIGNAL DECISION ---
     if signal is None:
-        # Explain why no signal
-        sp   = float(row.get('session_pct', 0))
-        mod2 = int(row.get('minute_of_day', 0))
-        iv_p = row.get('iv_proxy', 0)
-        iv   = float(iv_p) if iv_p and iv_p > 0 else float(row.get('atr_14_pct', 0))
-        if current_regime == REGIME_CRISIS:
-            reason = "CRISIS regime -- gate filtered (check logs for [Gate] BLOCKED)"
-        elif sp < 0.10 or sp > 0.92:
-            reason = f"Outside trading session window (sp={sp:.2f})"
-        elif 180 <= mod2 <= 225:
-            reason = "Lunch hour filter (12:15-13:00)"
-        elif row.get('is_expiry', 0) == 1 and mod2 > 315:
-            reason = "Expiry day -- no new trades after 14:30"
-        elif iv < 0.05:
-            reason = f"IV too low for premium trades (iv={iv:.3f})"
-        else:
-            reason = "Models disagree or confidence below threshold"
-        print(f"  SIGNAL : NONE  [{reason}]")
+        # Show the actual gate that blocked — no guessing
+        reason = block_reason if block_reason else "gate filtered (check logs)"
+        # Strip the [GateXX] prefix for display, keep just the human part
+        display_reason = reason.replace('[Gate] BLOCKED: ', '').replace('[Gate', '[G').strip()
+        print(f"  SIGNAL : NONE  [{display_reason}]")
         
         # Even when no signal, show dynamic strike monitor for monitoring
         print(sep2)
@@ -450,46 +438,10 @@ def print_live_dashboard(row: pd.Series, analysis: dict,
         print(f"  [SIGNAL] TRADE SIGNAL ACTIVE: {signal_dir} | Confidence: {signal_conf:.1%}")
         print(f"  ACTION: Execute {signal_dir} trade (system will auto-execute in paper mode)")
     else:
-        # No signal - explain why and give recommendation
-        # Get block reason
-        sp = float(row.get('session_pct', 0))
-        mod = int(row.get('minute_of_day', 0))
-        iv_p = row.get('iv_proxy', 0)
-        iv = float(iv_p) if iv_p and iv_p > 0 else float(row.get('atr_14_pct', 0))
-        
-        if current_regime == REGIME_CRISIS:
-            block_reason = "Crisis regime (bypass active if agreement>=85% -- see logs)"
-        elif sp < 0.10:
-            block_reason = "Pre-market session (first 10%)"
-        elif sp > 0.92:
-            block_reason = "Post-market session (last 8%)"
-        elif 180 <= mod <= 225:
-            block_reason = "Lunch hour filter (12:15-13:00)"
-        elif row.get('is_expiry', 0) == 1 and mod > 315:
-            block_reason = "Expiry day late trading (after 14:30)"
-        elif iv < 0.05:
-            block_reason = f"IV too low for premium trades (iv={iv:.3f})"
-        elif ml_avg_conf < 0.58:
-            block_reason = f"Insufficient ML confidence ({ml_avg_conf:.1%} < 58%)"
-        elif not agreement:
-            block_reason = "ML and technical analysis contradicting"
-        else:
-            block_reason = "Kill-switch or other filter blocked"
-        
-        print(f"  NO SIGNAL: {block_reason}")
+        # No signal - show the actual gate reason (passed from generate_signal via live.py)
+        _display = block_reason if block_reason else "gate filtered (check logs)"
+        print(f"  NO SIGNAL: {_display}")
 
-        # Actionable recommendation — only show when the block is not a hard session/regime gate
-        _hard_gate = sp < 0.10 or sp > 0.92 or (180 <= mod < 225) or (row.get('is_expiry', 0) == 1 and mod > 315)
-        if not _hard_gate:
-            if ml_avg_conf >= 0.55:
-                if ml_direction == "BULLISH":
-                    print(f"  RECOMMENDATION: Cautious LONG bias - Wait for confirming signal")
-                elif ml_direction == "BEARISH":
-                    print(f"  RECOMMENDATION: Cautious SHORT bias - Wait for confirming signal")
-                else:
-                    print(f"  RECOMMENDATION: STAY FLAT - No clear directional edge")
-            else:
-                print(f"  RECOMMENDATION: STAY FLAT - Low confidence ({ml_avg_conf:.1%})")
     
     print(sep2)
     

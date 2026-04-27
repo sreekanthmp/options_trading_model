@@ -16,9 +16,11 @@ import pandas as pd
 import warnings
 warnings.filterwarnings('ignore')
 
+
 from ..config import (
-    KILL_DAILY_DD_PCT, KILL_DAILY_DD_PCT_PAPER, KILL_CONSEC_LOSSES, KILL_VOL_SHOCK_MULT,
+    KILL_DAILY_DD_PCT, KILL_DAILY_DD_PCT_PAPER, KILL_CONSEC_LOSSES, KILL_CONSEC_LOSSES_PAPER, KILL_VOL_SHOCK_MULT,
     KILL_REGIME_FLIP_MINS, KILL_VRECOVERY_AGREE,
+    KILL_WEEKLY_DD_HALVE_PCT, KILL_MONTHLY_DD_HALT_PCT, CONF_SIZE_BANDS,
     TRANSITION_SHOCK_MINS, TRANSITION_CONF_BOOST,
     REGIME_CRISIS, REGIME_TRENDING, REGIME_RANGING, REGIME_NAMES,
     _training_feature_stats,
@@ -27,7 +29,7 @@ from ..config import (
 logger = logging.getLogger(__name__)
 
 # Additional live-safe constants (not in config to keep backward-compat)
-MAX_TRADES_PER_DAY          = 8     # hard daily cap on total trades (not per direction)
+MAX_TRADES_PER_DAY          = 999   # DISABLED - no daily trade limit (only loss-based restrictions)
 COOL_DOWN_AFTER_CONSEC_LOSS = 30    # minutes to pause after consecutive-loss gate fires
 DAILY_DD_WARN_PCT           = 0.70  # at 70% of daily DD limit, reduce position size
 ORDER_DEDUP_EXPIRY_SECONDS  = 30    # duplicate guard window
@@ -81,23 +83,60 @@ class KillSwitch:
         self._flatten_requested : bool  = False
         self._flatten_reason    : str   = ''
 
+        # CRISIS bypass: consecutive TRENDING micro-regime counter
+        # Bypass only fires after 2 consecutive TRENDING bars to avoid whipsaws.
+        self._consec_trending_bars: int = 0
+
+        # CRISIS bypass: consecutive bars where ML direction is stable (same direction)
+        # WHY: Trade 2 (Apr-20) fired after 4 bars of ML=DOWN then 1-bar flip to UP.
+        # Model instability on feature noise caused a false signal at the flip point.
+        # Require ML direction stable for 2+ bars before bypass fires.
+        self._consec_ml_direction: str = ''   # last seen ML direction in CRISIS
+        self._consec_ml_bars: int = 0         # consecutive bars with same ML direction
+
         # Edge Case 3: Black Swan Gap tracking
         self._black_swan_time = None  # When gap shock detected
         self._black_swan_gap = 0.0    # Gap magnitude
 
+        # Regime history for regime_conf_boost() — must be in __init__ so
+        # reset_day() can safely call .clear() without AttributeError
+        self._regime_history: list = []
+
+        # Weekly / monthly drawdown tracking.
+        # Anchored to initial capital so a losing week doesn't permanently
+        # shrink the next week's budget (ratchet-effect avoidance).
+        self._week_start_equity  : float = capital
+        self._month_start_equity : float = capital
+        self._current_week       : int   = -1   # ISO week number
+        self._current_month      : int   = -1
+
     def reset_day(self):
         """Call at the start of each trading day."""
         self.day_start_equity  = self.current_equity
-        self.consec_losses     = 0
         self._day_halted       = False
         self._halt_reason      = ''
         self._vrecovery_bypass = False
         self._black_swan_time  = None
         self._black_swan_gap   = 0.0
-        self._cool_down_until  = None
         self._trades_today     = 0
         self._flatten_requested = False
         self._flatten_reason    = ''
+        # Clear cross-day regime bias — yesterday's ranging bars must not
+        # inflate today's confidence floor via regime_conf_boost()
+        self._regime_history.clear()
+        # Only reset consecutive-loss cooldown if it has already expired.
+        # If the cooldown is still active (e.g. late-session losses and restart
+        # before the 30-min window expires), keep it — don't give a free reset
+        # just because the calendar day rolled over.
+        if self._cool_down_until is None or datetime.now() >= self._cool_down_until:
+            self.consec_losses    = 0
+            self._cool_down_until = None
+        else:
+            remaining = (self._cool_down_until - datetime.now()).seconds // 60
+            logger.info(
+                f"[KillSwitch] reset_day: consecutive-loss cooldown still active "
+                f"({remaining}min remaining). Carrying over to new session."
+            )
 
     def record_trade(self, pnl: float):
         """Update state after a completed trade."""
@@ -111,7 +150,9 @@ class KillSwitch:
             self.consec_losses = 0
 
         # Kill-switch + cool-down on consecutive losses
-        if self.consec_losses >= KILL_CONSEC_LOSSES:
+        # Paper mode gets a higher limit (3) to gather more statistical samples
+        _consec_limit = KILL_CONSEC_LOSSES_PAPER if self.paper_mode else KILL_CONSEC_LOSSES
+        if self.consec_losses >= _consec_limit:
             self.trading_halted   = True
             self._cool_down_until = datetime.now() + timedelta(minutes=COOL_DOWN_AFTER_CONSEC_LOSS)
             logger.warning(
@@ -171,12 +212,13 @@ class KillSwitch:
                   f"{REGIME_NAMES.get(new_regime, 'UNKNOWN')}. Cooldown: {KILL_REGIME_FLIP_MINS} min")
         self.last_regime = new_regime
         # Track regime history for frequency gate (Issue 5)
-        if not hasattr(self, '_regime_history'):
-            self._regime_history = []
-        self._regime_history.append((datetime.now(), new_regime))
-        # Keep only last 20 days worth of entries
-        if len(self._regime_history) > 20:
-            self._regime_history = self._regime_history[-20:]
+        now = datetime.now()
+        self._regime_history.append((now, new_regime))
+        # Time-based purge: keep only entries from the last 4 hours
+        # WHY: count-based kept 20 entries across days; intraday regime mix
+        # from yesterday would unfairly boost today's conf floor.
+        cutoff = now - timedelta(hours=4)
+        self._regime_history = [(t, r) for t, r in self._regime_history if t >= cutoff]
 
     def regime_conf_boost(self) -> float:
         """
@@ -185,7 +227,7 @@ class KillSwitch:
         confidence floor boost (+0.05) so only high-conviction signals fire.
         Returns 0.0 when regime mix is normal.
         """
-        if not hasattr(self, '_regime_history') or len(self._regime_history) < 5:
+        if len(self._regime_history) < 5:
             return 0.0
         recent = [r for _, r in self._regime_history[-10:]]
         ranging_pct = sum(1 for r in recent if r == REGIME_RANGING) / len(recent)
@@ -210,14 +252,15 @@ class KillSwitch:
         if self.regime_flip_time is None:
             return False
         import datetime as _dt
-        mins_since = (_dt.datetime.now() - self.regime_flip_time).seconds / 60
+        mins_since = (_dt.datetime.now() - self.regime_flip_time).total_seconds() / 60
         return mins_since < TRANSITION_SHOCK_MINS
 
     def check(self, current_atr: float = 0, avg_atr: float = 0,
               current_regime: int = REGIME_RANGING,
               micro_regime: str = 'UNKNOWN',
               agreement: float = 0.0,
-              minute_of_day: int = 0) -> tuple:
+              minute_of_day: int = 0,
+              ml_direction: str = '') -> tuple:
         """
         Returns (blocked: bool, reason: str).
         blocked=True means do NOT enter any new trade this tick.
@@ -253,18 +296,21 @@ class KillSwitch:
             return True, f"Max trades/day reached: {self._trades_today}/{MAX_TRADES_PER_DAY}"
 
         # Gate 2: consecutive losses + cool-down (hard -- never bypassed)
-        if self.consec_losses >= KILL_CONSEC_LOSSES:
+        # FIX: check cooldown expiry BEFORE blocking, so the reset fires on bar N
+        # and bar N can proceed (not blocked one extra bar by the off-by-one).
+        _consec_limit = KILL_CONSEC_LOSSES_PAPER if self.paper_mode else KILL_CONSEC_LOSSES
+        if self._cool_down_until and _dt.datetime.now() >= self._cool_down_until:
+            # Cooldown expired — reset counter before checking limit
+            self.consec_losses    = 0
+            self._cool_down_until = None
+            logger.info("[KillSwitch] Cool-down expired. Consecutive-loss counter reset.")
+        if self.consec_losses >= _consec_limit:
             if self._cool_down_until and _dt.datetime.now() < self._cool_down_until:
-                remaining = (self._cool_down_until - _dt.datetime.now()).seconds // 60
+                remaining = int((self._cool_down_until - _dt.datetime.now()).total_seconds() // 60)
                 return True, (f"Consecutive losses cool-down: {remaining}min remaining "
                               f"({self.consec_losses} losses)")
-            elif self._cool_down_until and _dt.datetime.now() >= self._cool_down_until:
-                # Cool-down expired — reset consecutive loss counter
-                self.consec_losses  = 0
-                self._cool_down_until = None
-                logger.info("[KillSwitch] Cool-down expired. Consecutive-loss counter reset.")
             else:
-                return True, f"Consecutive losses: {self.consec_losses} (limit {KILL_CONSEC_LOSSES})"
+                return True, f"Consecutive losses: {self.consec_losses} (limit {_consec_limit})"
 
         # Gate 3: vol shock (hard -- never bypassed)
         if avg_atr > 0 and current_atr > 0:
@@ -275,7 +321,7 @@ class KillSwitch:
         # Gate 5: Black Swan gap shock (hard -- never bypassed)
         # Edge Case 3: Block for 45 min after extreme opening gap
         if self._black_swan_time is not None:
-            mins_since_gap = (_dt.datetime.now() - self._black_swan_time).seconds / 60
+            mins_since_gap = (_dt.datetime.now() - self._black_swan_time).total_seconds() / 60
             if mins_since_gap < 45:
                 return True, (f"Black Swan cooldown: {mins_since_gap:.0f}/45 min "
                              f"(gap {self._black_swan_gap:.2%})")
@@ -288,7 +334,7 @@ class KillSwitch:
         # Gate 4: regime flip cooldown -- bypassable on confirmed BREAKOUT
         # Edge Case 4: Regime Whipsaw mitigation
         if self.regime_flip_time is not None:
-            mins_since = (_dt.datetime.now() - self.regime_flip_time).seconds / 60
+            mins_since = (_dt.datetime.now() - self.regime_flip_time).total_seconds() / 60
             if mins_since < KILL_REGIME_FLIP_MINS:
                 # V-Recovery bypass: BREAKOUT micro-regime with strong agreement
                 # allows trading through cooldown to catch post-crisis reversals
@@ -304,32 +350,111 @@ class KillSwitch:
                                   f"(cooldown {KILL_REGIME_FLIP_MINS}min)")
             else:
                 self._vrecovery_bypass = False
-                # Cooldown expired
-                if mins_since >= KILL_REGIME_FLIP_MINS and mins_since < KILL_REGIME_FLIP_MINS + 1:
+                if self.regime_flip_time is not None:
                     print(f"  [Regime Flip] Cooldown expired. Trading re-enabled.")
+                    self.regime_flip_time = None
 
         # Gate 6: crisis regime
         # Hard block unless confidence is very high AND intraday is calm/trending.
         # This prevents missing strong directional moves when daily HMM lags.
         # Conditions to bypass (all must be true):
         #   - ML agreement >= 85% (avg_conf proxy via `agreement` arg)
-        #   - micro_regime is TRENDING (clear intraday direction, not chop)
+        #   - micro_regime is TRENDING for 2 consecutive bars (not just 1 bar)
+        #     WHY: both Apr-20 losses entered on single-bar TRENDING_UP that
+        #     immediately reversed. Requiring 2 consecutive bars confirms the
+        #     trend is established, not a 1-bar spike.
         #   - Not in first/last 30 min (session edges are noisy)
         if current_regime == REGIME_CRISIS:
+            # Track consecutive TRENDING micro-regime bars
+            if micro_regime in ('TRENDING_UP', 'TRENDING_DN'):
+                self._consec_trending_bars += 1
+            else:
+                self._consec_trending_bars = 0
+
+            # Track consecutive bars with same ML direction
+            # WHY: Trade 2 Apr-20 — 4 bars ML=DOWN then 1-bar flip to UP fired entry.
+            # Model instability at the flip point = worst possible entry timing.
+            if ml_direction and ml_direction == self._consec_ml_direction:
+                self._consec_ml_bars += 1
+            elif ml_direction:
+                self._consec_ml_direction = ml_direction
+                self._consec_ml_bars = 1
+            else:
+                self._consec_ml_bars = 0
+
             crisis_bypass = (
-                agreement >= 0.85
+                agreement >= KILL_VRECOVERY_AGREE - 1e-6   # float tolerance
                 and micro_regime in ('TRENDING_UP', 'TRENDING_DN')
-                and 30 <= minute_of_day <= 345
+                and self._consec_trending_bars >= 2         # trending 2 bars in a row
+                and self._consec_ml_bars >= 2               # ML direction stable 2 bars
+                and 60 <= minute_of_day <= 345
             )
             if not crisis_bypass:
                 return True, "CRISIS regime -- no new trades"
             else:
                 logger.info(
                     f"[KillSwitch] CRISIS bypass: agreement={agreement:.1%} "
-                    f"micro={micro_regime} min={minute_of_day}"
+                    f"micro={micro_regime} consec_trending={self._consec_trending_bars} "
+                    f"consec_ml={self._consec_ml_bars} ml_dir={self._consec_ml_direction} "
+                    f"min={minute_of_day}"
                 )
 
         return False, ''
+
+    def update_period_equity(self):
+        """
+        Roll week/month anchors when the calendar period changes.
+        Call once per bar (cheap — only updates on period boundary).
+        """
+        now = datetime.now()
+        iso_week  = now.isocalendar()[1]
+        month     = now.month
+        if self._current_week != iso_week:
+            self._week_start_equity = self.current_equity
+            self._current_week      = iso_week
+        if self._current_month != month:
+            self._month_start_equity = self.current_equity
+            self._current_month      = month
+
+    def check_drawdown_protection(self) -> tuple:
+        """
+        Returns (halt: bool, reason: str, size_mult: float).
+
+        halt=True  → monthly DD limit breached; no new entries (manual review required).
+        halt=False → size_mult < 1.0 when weekly DD exceeds halve threshold.
+
+        Designed to be called before every new entry attempt.
+        Does NOT modify trading_halted — that is reserved for the daily gate
+        so the two circuits are independent and don't interfere.
+        """
+        # Monthly gate (hard — requires manual reset)
+        monthly_dd = (self.current_equity - self._month_start_equity) / (self._month_start_equity + 1e-9)
+        if monthly_dd <= -KILL_MONTHLY_DD_HALT_PCT:
+            return True, (f"Monthly DD {monthly_dd:.1%} exceeded limit "
+                          f"{-KILL_MONTHLY_DD_HALT_PCT:.0%} — manual review required"), 0.0
+
+        # Weekly gate (soft — halve size)
+        weekly_dd   = (self.current_equity - self._week_start_equity) / (self._week_start_equity + 1e-9)
+        size_mult   = 0.5 if weekly_dd <= -KILL_WEEKLY_DD_HALVE_PCT else 1.0
+        if size_mult < 1.0:
+            logger.info(f"[KillSwitch] Weekly DD {weekly_dd:.1%} > {KILL_WEEKLY_DD_HALVE_PCT:.0%} "
+                        f"threshold — position size halved")
+        return False, '', size_mult
+
+    def get_conf_size_multiplier(self, conf: float) -> float:
+        """
+        Confidence-based capital scaling multiplier (0.5–1.0).
+
+        Maps final_conf → fraction of available capital to deploy.
+        Applied to the capital argument passed to select_option() so that
+        low-confidence signals trade half size while strong signals trade full.
+
+        Bands are defined in config.CONF_SIZE_BANDS and reviewed quarterly.
+        """
+        for threshold, mult in sorted(CONF_SIZE_BANDS, reverse=True):
+            if conf >= threshold:
+                return mult
+        return 0.5   # fallback for conf below lowest band (should not reach here after floor check)
 
     def transition_conf_requirement(self) -> float:
         """

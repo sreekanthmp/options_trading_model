@@ -60,10 +60,11 @@ def build_analysis(row: pd.Series, current_regime: int) -> dict:
     bb_pos  = float(row.get('bb_pos', 0.5))
     bb_wid  = float(row.get('bb_width', 0))
 
-    if iv_rank < 20:   iv_regime = "IV LOW"
-    elif iv_rank < 50: iv_regime = "IV NORMAL-LOW"
-    elif iv_rank < 80: iv_regime = "IV NORMAL-HIGH"
-    else:              iv_regime = "IV HIGH (premium)"
+    # iv_proxy thresholds (annualised %): 0.5=low, 1.0=normal, 1.5=high, 2.0=crisis
+    if iv < 0.5:    iv_regime = "IV LOW"
+    elif iv < 1.0:  iv_regime = "IV NORMAL-LOW"
+    elif iv < 1.5:  iv_regime = "IV NORMAL-HIGH"
+    else:           iv_regime = "IV HIGH (premium)"
 
     # ---- Volume / Flow ----
     mfi     = float(row.get('mfi_14', 50))

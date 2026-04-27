@@ -176,7 +176,16 @@ class LiveSafetyManager:
         killed      = []
         warn_count  = 0
 
+        # Features that are naturally bounded [0,1] or binary — their boundary
+        # values are valid live observations, not OOD events. Exempting them
+        # prevents false DRIFT_KILL when e.g. pressure_ratio saturates at 1.0
+        # during genuine heavy directional flow.
+        BOUNDED_FEATURES = {'pressure_ratio', 'tick_imbalance', 'bb_squeeze',
+                            'or_break_up', 'or_break_dn', 'is_expiry'}
+
         for feat in active_features:
+            if feat in BOUNDED_FEATURES:
+                continue
             stats = training_stats.get(feat)
             if not stats:
                 continue
@@ -212,7 +221,43 @@ class LiveSafetyManager:
         return conf_mult, killed
 
     # -----------------------------------------------------------------------
-    # 7. Emergency shutdown
+    # 7. WebSocket staleness detection
+    # -----------------------------------------------------------------------
+    def check_websocket_staleness(self, current_time: datetime) -> tuple:
+        """
+        Check if WebSocket data is stale (no new bars for 5+ minutes during market hours).
+        
+        Returns (is_stale: bool, reason: str)
+        If stale, caller should trigger emergency flatten and halt trading.
+        """
+        last_bar_time = self.bar_validator.get_last_valid_timestamp()
+        
+        if last_bar_time is None:
+            # No bars validated yet - system just started
+            return False, ''
+        
+        try:
+            last_bar_dt = pd.Timestamp(last_bar_time)
+            age_seconds = (current_time - last_bar_dt).total_seconds()
+            
+            # If last bar is older than 5 minutes during market hours (9:15-15:30)
+            hour = current_time.hour
+            minute = current_time.minute
+            is_weekday = current_time.weekday() < 5
+            is_market_hours = is_weekday and ((hour == 9 and minute >= 15) or (10 <= hour < 15) or (hour == 15 and minute <= 30))
+            
+            if is_market_hours and age_seconds > 300:  # 5 minutes
+                reason = f"WEBSOCKET_STALE: Last bar {age_seconds:.0f}s old (>5min). WebSocket likely disconnected."
+                logger.critical(f"[Safety] {reason}")
+                return True, reason
+                
+        except Exception as e:
+            logger.warning(f"[Safety] WebSocket staleness check failed: {e}")
+        
+        return False, ''
+
+    # -----------------------------------------------------------------------
+    # 8. Emergency shutdown
     # -----------------------------------------------------------------------
     def request_shutdown(self, reason: str):
         self._shutdown_requested = True
@@ -226,7 +271,7 @@ class LiveSafetyManager:
         return self._shutdown_reason
 
     # -----------------------------------------------------------------------
-    # 8. Summary status (for dashboard)
+    # 9. Summary status (for dashboard)
     # -----------------------------------------------------------------------
     def status_dict(self) -> dict:
         return {
