@@ -171,10 +171,13 @@ def add_1min_features_production(df: pd.DataFrame) -> pd.DataFrame:
     # DMI / ADX
     # ------------------------------------------------------------------
     pdi, ndi, adx = _dmi(h, lo, c, 14)
-    df['adx_14']   = adx
-    df['dmi_pdi']  = pdi
-    df['dmi_ndi']  = ndi
-    df['dmi_diff'] = pdi - ndi
+    df['adx_14']    = adx
+    df['dmi_pdi']   = pdi
+    df['dmi_ndi']   = ndi
+    df['dmi_diff']  = pdi - ndi
+    # 3-bar ADX slope: positive = momentum building, negative = exhausting.
+    # Used by Gate7c-ADX v4.0 to distinguish rising-weak from falling-strong ADX.
+    df['adx_slope'] = adx.diff(3)
 
     # ------------------------------------------------------------------
     # MFI & OBV
@@ -215,10 +218,12 @@ def add_1min_features_production(df: pd.DataFrame) -> pd.DataFrame:
     df['body_momentum'] = (c - op).rolling(5).sum() / (hi_lo.rolling(5).sum() + EPS) * 100
 
     # ------------------------------------------------------------------
-    # VWAP
+    # VWAP  (volume-weighted average price, reset each session)
     # ------------------------------------------------------------------
     typ = (h + lo + c) / 3
-    df['vwap'] = typ.groupby(df['date'], group_keys=False).apply(lambda g: g.expanding().mean())
+    _cum_tv  = (typ * vol).groupby(df['date'], group_keys=False).apply(lambda g: g.expanding().sum())
+    _cum_vol = vol.groupby(df['date'], group_keys=False).apply(lambda g: g.expanding().sum())
+    df['vwap'] = _cum_tv / (_cum_vol + EPS)
     df['vwap_dist']  = (c - df['vwap']) / (df['vwap'] + EPS) * 100
     df['above_vwap'] = (c > df['vwap']).astype(int)
     df['vwap_slope'] = df['vwap_dist'].diff(5)
@@ -938,56 +943,6 @@ def add_calendar_features(df1m: pd.DataFrame) -> pd.DataFrame:
     return df1m
 
 
-def load_futures_basis_data(futures_path: str = 'nifty_futures_daily.csv') -> pd.DataFrame:
-    """Load and preprocess futures basis CSV once. Returns shifted DataFrame ready to merge."""
-    cols = ['futures_basis', 'futures_basis_chg']
-    if not os.path.exists(futures_path):
-        logger.warning(f"[Futures] {futures_path} not found — run nifty_futures_downloader.py.")
-        return pd.DataFrame(columns=['date'] + cols)
-
-    fut = pd.read_csv(futures_path)
-    fut['date'] = pd.to_datetime(fut['date']).dt.date
-    fut = fut.sort_values('date').drop_duplicates('date')
-
-    # Sanity check: NIFTY futures basis should be 0.0–2.0% normally.
-    # Values >3% indicate wrong data (raw point diff, not %). Fall back to empty.
-    if fut['futures_basis'].abs().median() > 3.0:
-        logger.warning(f"[Futures] futures_basis median={fut['futures_basis'].abs().median():.2f}% "
-                       f"— looks wrong (expected <3%). Setting to 0 to avoid feature drift.")
-        return pd.DataFrame(columns=['date'] + cols)
-
-    fut['futures_basis_chg'] = fut['futures_basis'].diff()
-    fut['date_next'] = fut['date'].shift(-1)
-    fut_use = fut[['date_next', 'futures_basis', 'futures_basis_chg']].dropna(subset=['date_next'])
-    fut_use = fut_use.rename(columns={'date_next': 'date'})
-    fut_use['date'] = pd.to_datetime(fut_use['date']).dt.date
-    return fut_use
-
-
-def add_futures_basis_features(df1m: pd.DataFrame,
-                                futures_path: str = 'nifty_futures_daily.csv',
-                                futures_df: pd.DataFrame = None) -> pd.DataFrame:
-    """
-    Add Nifty futures basis as a daily feature.
-    Pass futures_df (from load_futures_basis_data()) to avoid re-reading CSV every bar.
-    """
-    cols = ['futures_basis', 'futures_basis_chg']
-    df1m = df1m.drop(columns=[c for c in cols if c in df1m.columns])
-
-    if futures_df is None:
-        futures_df = load_futures_basis_data(futures_path)
-
-    if futures_df.empty:
-        for col in cols:
-            df1m[col] = 0.0
-        return df1m
-
-    df1m = df1m.merge(futures_df, on='date', how='left')
-    for col in cols:
-        df1m[col] = df1m[col].ffill().fillna(0.0)
-
-    logger.info(f"[Futures] Added futures basis features.")
-    return df1m
 
 
 def load_fii_dii_data(fii_path: str = 'fii_dii_flow.csv') -> pd.DataFrame:
@@ -1308,37 +1263,11 @@ FEATURE_LIVE_OK = {
     # Experimental features (OFF by default until proven in paper trading)
     'fft_cycle': False,               # FFT now handled separately as regime hint
     'cycle_vol_interaction': False,   # Dependent on fft_cycle
-    # Options chain + VIX: available live (daily CSV files loaded at startup)
-    'pcr_oi': True,
-    'max_pain_dist': True,
-    'iv_skew': True,
-    'oi_buildup': True,
-    'atm_oi_skew': True,
-    'day_vix': True,
-    'day_vix_regime': True,
-    'day_vix_chg': True,
     # Calendar: always available (derived from datetime)
     'day_of_week': True,
     'is_expiry_week': True,
     'is_monday': True,
     'is_friday': True,
-    # PCR volume + ATM IV: available live (options_data CSVs)
-    'pcr_vol': True,
-    'pcr_oi_vol_diff': True,
-    'atm_iv_ce': True,
-    'atm_iv_pe': True,
-    'atm_iv_avg': True,
-    # External data: available live if CSV files present
-    'futures_basis': True,       # bad CSV auto-detected and zeroed in add_futures_basis_features
-    'futures_basis_chg': True,
-    'fii_net_buy': True,
-    'dii_net_buy': True,
-    'fii_dii_net': True,
-    'fii_flow_regime': True,
-    'fii_5d_cumulative': True,
-    'sp500_ret_1d': True,
-    'sp500_ret_5d': True,
-    'global_risk_on': True,
 }
 
 # Tier-1: Core features (max 30, always enabled)
@@ -1350,7 +1279,7 @@ TIER_1_CORE = [
     'atr_14_pct', 'atr_ratio',
     # Momentum & Trend
     'rsi_14', 'rsi_slope',
-    'adx_14',
+    'adx_14', 'adx_slope',
     # VWAP (institutional flow)
     'vwap_dist', 'vwap_dev_vel',
     # Bollinger (volatility regime)
@@ -1467,40 +1396,11 @@ def get_feature_cols():
         'ta_flow_score',      # MFI-based money flow score (-1 to +1)
         'ta_overall_score',   # Overall TA bias combining all components (-2 to +2)
 
-        # ----- GROUP E: Options chain + India VIX (daily, shift-1, no lookahead) -----
-        'pcr_oi',         # Put/Call OI ratio (>1.2 = bullish floor)
-        'max_pain_dist',  # Distance from ATM to max pain strike (normalized)
-        'iv_skew',        # PE IV - CE IV (>0 = fear premium, puts expensive)
-        'oi_buildup',     # Net OI buildup direction (+1 CE, -1 PE dominant)
-        'atm_oi_skew',    # (ATM PE OI - ATM CE OI) / sum (directional bias)
-        'day_vix',        # Previous day India VIX close (raw level)
-        'day_vix_regime', # 0=low(<13), 1=normal(13-20), 2=high(>20)
-        'day_vix_chg',    # VIX % change vs 5-day avg (momentum)
-
-        # ----- GROUP F: Calendar context (derived from datetime, zero cost) -----
+        # ----- GROUP E: Calendar context (derived from datetime, zero cost) -----
         'day_of_week',    # 0=Mon..4=Fri (each day has distinct NIFTY behavior)
         'is_expiry_week', # 1 on Mon/Tue (expiry-week positioning effect)
         'is_monday',      # 1 on Monday (gap-prone, often weak open)
         'is_friday',      # 1 on Friday (position squaring, end-of-week moves)
-
-        # ----- GROUP G: PCR volume + ATM IV absolute level -----
-        'pcr_vol',         # PCR by volume (fresh daily positioning)
-        'pcr_oi_vol_diff', # OI vs volume PCR divergence (sentiment shift signal)
-        'atm_iv_ce',       # ATM CE IV proxy (absolute, not rank)
-        'atm_iv_pe',       # ATM PE IV proxy
-        'atm_iv_avg',      # Average ATM IV (options expensive vs cheap)
-
-        # ----- GROUP H: External macro (Tier 1+2, requires CSV downloaders) -----
-        'futures_basis',     # Nifty futures premium/discount % vs spot
-        'futures_basis_chg', # Change in basis (momentum)
-        'fii_net_buy',       # FII net buy/sell crores (institutional flow)
-        'dii_net_buy',       # DII net buy/sell crores
-        'fii_dii_net',       # Combined FII+DII net flow
-        'fii_flow_regime',   # -1=heavy selling, 0=neutral, 1=heavy buying
-        'fii_5d_cumulative', # 5-day rolling FII flow (trend)
-        'sp500_ret_1d',      # S&P 500 previous day return %
-        'sp500_ret_5d',      # S&P 500 5-day return %
-        'global_risk_on',    # -1/0/1 risk-off/neutral/risk-on
 
         # ----- GROUP I: Price Action Structures (v4.2) -----
         'struct_score',   # +1=HH/HL bullish structure, -1=LH/LL bearish, 0=mixed

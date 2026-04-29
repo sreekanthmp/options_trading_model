@@ -345,30 +345,8 @@ def fetch_option_chain_ndi(session=None, spot: float = 0.0) -> float:
 
 
 def fetch_fii_dii_flow() -> dict:
-    """
-    FII/DII net positions from fii_dii_flow.csv (downloaded by fii_dii_downloader.py).
-    Returns the most recent available day's data.
-    NSE publishes this daily at ~18:30 — so it's previous-day data for live trading.
-    Values are in crores (Rs).
-    """
-    import os
-    csv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-                            'fii_dii_flow.csv')
-    try:
-        if not os.path.exists(csv_path):
-            return {'fii_net': 0.0, 'dii_net': 0.0}
-        df = pd.read_csv(csv_path, parse_dates=['date'])
-        if df.empty:
-            return {'fii_net': 0.0, 'dii_net': 0.0}
-        df = df.sort_values('date')
-        last = df.iloc[-1]
-        fii = float(last.get('fii_net_buy', 0)) if not pd.isna(last.get('fii_net_buy')) else 0.0
-        dii = float(last.get('dii_net_buy', 0)) if not pd.isna(last.get('dii_net_buy')) else 0.0
-        logger.debug(f"[FII/DII] date={last['date']}, FII={fii:.1f} Cr, DII={dii:.1f} Cr")
-        return {'fii_net': fii, 'dii_net': dii}
-    except Exception as e:
-        logger.warning(f"[FII/DII] Error reading {csv_path}: {e}")
-        return {'fii_net': 0.0, 'dii_net': 0.0}
+    """Stub — FII/DII removed from feature set. Returns zeros for backward compatibility."""
+    return {'fii_net': 0.0, 'dii_net': 0.0}
 
 
 # calculate_time_decay_confidence and calculate_dynamic_stops live in

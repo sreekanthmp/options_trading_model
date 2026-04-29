@@ -13,25 +13,22 @@ from ..config import (
     LOT_SIZE, CONF_MIN,
     MAX_TRADES_PER_SESSION, DAILY_LOSS_LIMIT_RS, DOWN_ONLY_MODE,
     CONSEC_LOSS_COOLDOWN_MINS, ROLLING_WR_WINDOW, ROLLING_WR_MIN,
-    VIX_HALVE_THRESHOLD, MID_SESSION_SCORE_FLOOR,
+    MID_SESSION_SCORE_FLOOR,
     GAP_DAY_SINGLE_TRADE_PCT,
 )
 from ..data.loader import load_ohlcv
 from ..features.feature_engineering import (
     add_1min_features, add_htf_features, add_daily_features, get_feature_cols,
-    add_vix_features, load_vix_data,
     add_options_chain_features, compute_options_chain_features,
     add_calendar_features,
-    add_futures_basis_features, load_futures_basis_data,
-    add_fii_dii_features, load_fii_dii_data,
-    add_global_market_features, load_sp500_data,
     add_pcr_volume_features, compute_pcr_volume_features,
     FEATURE_COLS, FEATURE_LIVE_OK,
 )
 from ..regimes.hmm_regime import RegimeDetector, RegimeStateMachine, REGIME_UNCERTAIN, intraday_regime_override, compute_session_regime
 from ..signals.analysis import build_analysis, detect_micro_regime
 from ..execution.risk import KillSwitch, SetupFatigueTracker
-from ..signals.signal_generator import generate_signal, SignalState, _signal_state, get_last_block_reason
+from ..execution.v5_risk import _v5_risk_state
+from ..signals.signal_generator import generate_signal, generate_signal_v5, SignalState, _signal_state, get_last_block_reason
 from ..execution.orders import select_option, display_option_predictions, option_pnl_estimate
 from .dashboard import print_live_dashboard
 from ..data.websocket import (
@@ -47,7 +44,6 @@ from ..data.external_data import (
 from ..utils.time_utils import calculate_dynamic_stops
 from ..utils.live_safety import LiveSafetyManager
 from ..utils.trade_logger import TradeLogger
-from ..utils.premarket import get_premarket_bias
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +105,7 @@ def _live_loop_cleanup(streamer, paper):
         paper.end_of_day(_date.today().strftime('%Y-%m-%d'))
 
 
-def _assess_day_quality(row, regime_conf: float, vix_level: float, paper_mode: bool) -> str:
+def _assess_day_quality(row, regime_conf: float, vix_level: float = 0.0, paper_mode: bool = False) -> str:
     """
     Assess whether today is a good or bad trading day based on live market conditions.
     Called once at bar 20 (~20 min after startup) when indicators have stabilized.
@@ -147,13 +143,7 @@ def _assess_day_quality(row, regime_conf: float, vix_level: float, paper_mode: b
     else:
         good_signals.append(f"RSI healthy: 1m={rsi_1m:.0f} 5m={rsi_5m:.0f}")
 
-    # 4. VIX — not extreme
-    if vix_level > 25:
-        issues.append(f"VIX={vix_level:.1f} EXTREME (chaotic whipsaws)")
-    elif vix_level > 20:
-        issues.append(f"VIX={vix_level:.1f} HIGH (elevated volatility risk)")
-    else:
-        good_signals.append(f"VIX={vix_level:.1f} (manageable)")
+    # 4. VIX check removed — VIX data no longer loaded
 
     # 5. BB squeeze — low volatility, breakout pending
     if bb_width < 0.15:
@@ -262,21 +252,6 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
     # NOTE: reads 1300+ CSV files — do this AFTER cold-start to avoid blocking startup
     _options_df_static = None  # populated after cold-start below
 
-    # Pre-load daily-static external data once (avoids CSV re-read every bar)
-    _vix_result        = load_vix_data()
-    _vix_df_static     = _vix_result[0] if isinstance(_vix_result, tuple) else _vix_result
-    _futures_df_static = load_futures_basis_data()
-    _fii_df_static     = load_fii_dii_data()
-    _sp500_df_static   = load_sp500_data()
-
-    # Pre-check external data files at startup (warn if missing)
-    import os as _os
-    for _fname, _label in [('nifty_futures_daily.csv', 'Futures basis'),
-                            ('fii_dii_flow.csv',        'FII/DII flow'),
-                            ('sp500_daily.csv',         'S&P 500')]:
-        if not _os.path.exists(_fname):
-            logger.warning(f"[Startup] {_label}: {_fname} not found — feature will be 0 (run downloader)")
-
     # 1. Initial Regime Detection
     if df1d_static is not None:
         regime_series = regime_det.predict(df1d_static)
@@ -307,7 +282,7 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
     _fast_losses_today  = 0      # MAX_HOLD_EXIT count today
     _last_exit_bar_time = None   # bar time of last exit (cooldown)
     COOLDOWN_MINS       = 0     # no time-based cooldown — signal gates already filter bad re-entries
-    CONF_ESCALATION     = [0.90, 0.92, 0.95]   # CONF_MIN=0.90 baseline; escalates after losses
+    CONF_ESCALATION     = [0.0, 0.0, 0.0]   # disabled — model accuracy 54-66% makes 0.90+ unreachable
     _gap_down_day       = False  # True when today opened with gap >= 0.5% vs prev close
     # Daily session controls
     _session_trades_today = 0    # total trades taken this session (cap = MAX_TRADES_PER_SESSION)
@@ -467,17 +442,6 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
         print(f"  [Warmup] Seeded with {_mins_elapsed} min elapsed since market open — warmup skipped.")
 
     # Pre-market bias analysis (uses VIX, S&P500, FII/DII CSVs — no extra API calls)
-    _pm_bias = get_premarket_bias()
-    _pm_bias.compute(session=session)
-    _pm_bias.print_summary()
-    # Apply high-VIX extra trades to scarcity counter
-    _signal_state._extra_trades_today = _pm_bias.get_extra_trades_allowed()
-    # D1 skip-day: if any hard pre-market rule fires, block all entries today
-    _premarket_skip_day = _pm_bias.skip_day
-    if _premarket_skip_day:
-        logger.warning(f"[PreMarket] SKIP DAY: {_pm_bias.skip_reason} — no entries today")
-    # D1 VIX halve: apply 0.5 multiplier to lot sizing when VIX > 22
-    _vix_halve_active = _pm_bias.vix_halve
 
     # Per-bar state — initialised here so they are always defined even when a
     # bar is skipped via `continue` before the assignment point.
@@ -519,15 +483,8 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
             setup_fatigue.reset_day(today_d)  # Reset setup fatigue tracker
             tl = TradeLogger()   # new file for the new day
             _signal_state.reset_day()
+            _v5_risk_state.reset_day()
             last_trade_day = today_d
-            # Recompute pre-market bias for new day and update extra trades
-            _pm_bias.compute(session=session)
-            _pm_bias.print_summary()
-            _signal_state._extra_trades_today = _pm_bias.get_extra_trades_allowed()
-            _premarket_skip_day = _pm_bias.skip_day
-            _vix_halve_active   = _pm_bias.vix_halve
-            if _premarket_skip_day:
-                logger.warning(f"[PreMarket] SKIP DAY: {_pm_bias.skip_reason} — no entries today")
             # Reset per-day entry filters
             _day_open            = None
             _gap_down_day        = False
@@ -692,21 +649,6 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
             htf_recalc_needed = False
             print(f"  [OK] HTF features recalculated with fresh API data")
 
-        # Add India VIX features (pre-loaded at startup — no CSV read per bar)
-        try:
-            recent = add_vix_features(recent, vix_df=_vix_df_static)
-        except Exception as _e:
-            logger.debug(f"[VIX] Feature add failed: {_e}")
-        for _vc in ['day_vix', 'day_vix_regime', 'day_vix_chg']:
-            if _vc not in recent.columns:
-                recent[_vc] = 0.0
-        # Fallback: if merge produced 0.0 (date mismatch), inject last known value directly
-        if _vix_df_static is not None and not _vix_df_static.empty and recent['day_vix'].iloc[-1] == 0.0:
-            _vix_last = _vix_df_static.iloc[-1]
-            recent['day_vix']        = recent['day_vix'].replace(0.0, _vix_last.get('day_vix', 0.0))
-            recent['day_vix_regime'] = recent['day_vix_regime'].replace(0.0, _vix_last.get('day_vix_regime', 0.0))
-            recent['day_vix_chg']    = recent['day_vix_chg'].replace(0.0, _vix_last.get('day_vix_chg', 0.0))
-
         # Add options chain features (PCR OI, max pain, IV skew — previous day)
         if _options_df_static is not None and not _options_df_static.empty:
             try:
@@ -734,45 +676,6 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
         for _pv in ['pcr_vol', 'pcr_oi_vol_diff', 'atm_iv_ce', 'atm_iv_pe', 'atm_iv_avg']:
             if _pv not in recent.columns:
                 recent[_pv] = 0.0
-
-        # Futures basis (pre-loaded at startup — no CSV read per bar)
-        try:
-            recent = add_futures_basis_features(recent, futures_df=_futures_df_static)
-        except Exception as _e:
-            logger.debug(f"[Futures] Feature add failed: {_e}")
-        for _fb in ['futures_basis', 'futures_basis_chg']:
-            if _fb not in recent.columns:
-                recent[_fb] = 0.0
-
-        # FII/DII flow (pre-loaded at startup — no CSV read per bar)
-        try:
-            recent = add_fii_dii_features(recent, fii_df=_fii_df_static)
-        except Exception as _e:
-            logger.debug(f"[FII] Feature add failed: {_e}")
-        for _fi in ['fii_net_buy', 'dii_net_buy', 'fii_dii_net', 'fii_flow_regime', 'fii_5d_cumulative']:
-            if _fi not in recent.columns:
-                recent[_fi] = 0.0
-        # Fallback: inject last known FII values if merge produced 0 (date mismatch)
-        if _fii_df_static is not None and not _fii_df_static.empty and recent['fii_net_buy'].iloc[-1] == 0.0:
-            _fii_last = _fii_df_static.iloc[-1]
-            for _fc in ['fii_net_buy', 'dii_net_buy', 'fii_dii_net', 'fii_flow_regime', 'fii_5d_cumulative']:
-                if _fc in _fii_last.index:
-                    recent[_fc] = recent[_fc].replace(0.0, float(_fii_last[_fc]))
-
-        # Global market context — S&P 500 (pre-loaded at startup — no CSV read per bar)
-        try:
-            recent = add_global_market_features(recent, sp500_df=_sp500_df_static)
-        except Exception as _e:
-            logger.debug(f"[SP500] Feature add failed: {_e}")
-        for _gm in ['sp500_ret_1d', 'sp500_ret_5d', 'global_risk_on']:
-            if _gm not in recent.columns:
-                recent[_gm] = 0.0
-        # Fallback: inject last known SP500 values if merge produced 0 (date mismatch)
-        if _sp500_df_static is not None and not _sp500_df_static.empty and recent['sp500_ret_1d'].iloc[-1] == 0.0:
-            _sp_last = _sp500_df_static.iloc[-1]
-            for _sc in ['sp500_ret_1d', 'sp500_ret_5d', 'global_risk_on']:
-                if _sc in _sp_last.index:
-                    recent[_sc] = recent[_sc].replace(0.0, float(_sp_last[_sc]))
 
         # Ensure all expected HTF columns exist (initialize with 0.0 if missing)
         htf_cols_all = ([f'tf5_ret_{n}' for n in [1,3,6]] + 
@@ -1084,6 +987,8 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
             if gap_pct >= GAP_DAY_SINGLE_TRADE_PCT:
                 _is_gap_day = True
                 logger.info(f"[Safety] Gap day flagged: |gap|={gap_pct:.2f}% >= {GAP_DAY_SINGLE_TRADE_PCT}% — max 1 trade today")
+            # Sync gap-day flag to V5 risk state
+            _v5_risk_state.set_gap_day(signed_gap)
             _black_swan_checked_dates.add(today_d)
 
         # Expiry-day: log current zone every bar so operator can track it
@@ -1145,7 +1050,10 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
             _non_crisis_streak = 0
             _crisis_entry_cooldown = 3
             logger.info(f"CRISIS entered -> {_crisis_entry_cooldown}-bar bypass cooldown")
-        if current_regime == REGIME_CRISIS and _crisis_entry_cooldown > 0:
+        # Count down every bar (not only in CRISIS) so flickering CRISIS->non-CRISIS
+        # doesn't stall the counter — previously it reset to 3 on re-entry then
+        # only ticked while in CRISIS, leaving it stuck at 1 for the rest of session.
+        if _crisis_entry_cooldown > 0:
             _crisis_entry_cooldown -= 1
 
         # Track consecutive non-CRISIS bars to detect genuine CRISIS exit.
@@ -1214,13 +1122,9 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
             tl.log_signal_blocked(now, f'POST_CRISIS_COOLDOWN: {_post_crisis_cooldown} bars', row)
         elif regime_uncertain:
             tl.log_signal_blocked(now, 'REGIME_UNCERTAIN', row)
-        elif drift_conf_mult == 0.0 and not _crisis_bypass:
-            tl.log_signal_blocked(now, f'FEATURE_DRIFT_KILLED: {drift_killed[:3]}', row)
-
-        # In CRISIS bypass, skip drift kill — large moves are inherently OOD vs training
-        # but KillSwitch has already validated 85%+ agreement. Drift kill on a 300pt
-        # trending day blocks the exact signals the system should be taking.
-        _drift_ok = (drift_conf_mult > 0.0) or _crisis_bypass
+        # drift_conf_mult is never 0.0 (worst case = 0.25 heavy penalty); no hard block here.
+        # Drift-killed features are logged at CRITICAL level in check_feature_drift().
+        _drift_ok = True
         # -----------------------------------------------------------------------
         # DAILY SESSION CONTROLS (hard stops before signal generation)
         # -----------------------------------------------------------------------
@@ -1277,9 +1181,14 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
             logger.debug(f"[SessionRegime] {_session_regime_label} (score={_session_regime_score:.2f}) — waiting for TRENDING_CONFIRMED")
 
         _consec_loss_blocked = (_consec_loss_until is not None and now < _consec_loss_until)
+        if _session_halted and not _warmup_blocked and not _crisis_entry_cooldown and not _post_crisis_cooldown and not regime_uncertain:
+            tl.log_signal_blocked(now, 'SESSION_HALTED', row)
+        elif _consec_loss_blocked and not _warmup_blocked:
+            tl.log_signal_blocked(now, 'CONSEC_LOSS_COOLDOWN', row)
+        elif _observation_mode and not _warmup_blocked:
+            tl.log_signal_blocked(now, 'OBSERVATION_MODE: rolling WR too low', row)
         if not ks_blocked and not _warmup_blocked and _post_crisis_cooldown == 0 and not regime_uncertain and _drift_ok \
-                and not _session_halted and not _consec_loss_blocked and not _observation_mode \
-                and not _premarket_skip_day:
+                and not _session_halted and not _consec_loss_blocked and not _observation_mode:
             # Issue 5: regime-frequency boost — raises conf floor in range-heavy periods
             regime_boost = ks.regime_conf_boost()
             # CRISIS bypass: active when KillSwitch allowed trading despite CRISIS regime.
@@ -1304,10 +1213,28 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
                                      crisis_bypass=_crisis_bypass,
                                      regime_conf=regime_conf)
 
+            # V5 OVERRIDE: Run the trend-following V5 signal generator and use its
+            # output when it fires — V5 enforces stricter gates (TRENDING-only,
+            # pullback-resume, direction-regime alignment) which improve precision.
+            # V4 signal is kept as fallback for CRISIS bypass (V5 blocks CRISIS by design).
+            if not _crisis_bypass:
+                _v5_signal = generate_signal_v5(
+                    row, models, current_regime,
+                    micro_regime=micro_regime,
+                    signal_state=_signal_state,
+                    extra_conf_floor=_combined_extra,
+                    crisis_bypass=False,
+                    regime_conf=regime_conf,
+                    v5_risk_state=_v5_risk_state,
+                    capital=capital,
+                )
+                if _v5_signal is not None:
+                    signal = _v5_signal   # V5 fired — use it (stricter gates = higher precision)
+
             # Day quality assessment — at bar 1 (if started mid-session),
             # bar 20, and every 30 bars thereafter (~every 30 min)
             if _bar_counter == 1 or _bar_counter == 20 or (_bar_counter > 20 and _bar_counter % 30 == 0):
-                _assess_day_quality(row, regime_conf, _pm_bias.vix_level, paper_mode)
+                _assess_day_quality(row, regime_conf, 0.0, paper_mode)
 
             # Apply feature-drift confidence penalty to the generated signal.
             # CRISIS bypass: skip drift penalty — CRISIS conditions are inherently OOD
@@ -1344,20 +1271,6 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
                     print(f"  [OFI Boost] Sell pressure {1-ofi_ratio:.1%} -> "
                           f"Confidence boosted to {signal['avg_conf']:.1%}")
             
-            # Pre-market bias adjustment
-            # Aligned signals get small boost; opposing signals need extra conf
-            if signal and not _crisis_bypass:
-                _bias_adj = _pm_bias.get_conf_adjustment(signal['direction'])
-                if _bias_adj != 0.0:
-                    _orig_conf = signal.get('avg_conf', 0.0)
-                    signal['avg_conf'] = max(0.0, min(0.99, _orig_conf + _bias_adj))
-                    signal['premarket_bias_adj'] = _bias_adj
-                    if _bias_adj < 0:
-                        logger.info(f"[PreMarket] Bias={_pm_bias.bias_score:+d} penalises "
-                                    f"{signal['direction']} signal: conf {_orig_conf:.2f}->{signal['avg_conf']:.2f}")
-                    else:
-                        logger.debug(f"[PreMarket] Bias={_pm_bias.bias_score:+d} boosts "
-                                     f"{signal['direction']} signal: conf {_orig_conf:.2f}->{signal['avg_conf']:.2f}")
 
             # Filter signal if in regime transition zone
             if signal and ks.in_transition_zone():
@@ -1419,44 +1332,31 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
                 _entry_blocked = False
                 _mod_now = int(row.get('minute_of_day', 0))
 
-                # Session regime gate: require TRENDING_CONFIRMED before entry.
-                # compute_session_regime() was called above and result cached.
-                # Crisis bypass skips this — V-recovery fires regardless of session regime.
+                # Session regime gate: require at least TRENDING_WEAK (score >= 2/4).
+                # TRENDING_CONFIRMED (3/4) was too strict — bb_squeeze=1 alone failed it
+                # even with ADX=47. NO_TRADE (mod<30 or mod>=330) still hard-blocks.
                 if not _entry_blocked and not _crisis_bypass:
-                    if _session_regime_label != 'TRENDING_CONFIRMED':
-                        logger.info(f"[SessionRegime] ENTRY BLOCKED: {_session_regime_label} "
-                                    f"score={_session_regime_score:.2f} — need TRENDING_CONFIRMED")
-                        tl.log_signal_blocked(now,
-                            f'SESSION_REGIME: {_session_regime_label} score={_session_regime_score:.2f}',
-                            row)
+                    if _session_regime_label == 'NO_TRADE':
+                        logger.info(f"[SessionRegime] ENTRY BLOCKED: NO_TRADE zone (mod={_mod_now})")
+                        tl.log_signal_blocked(now, f'SESSION_REGIME: NO_TRADE mod={_mod_now}', row)
                         _entry_blocked = True
-                    # Mid-session double-confirm (D3): after first intraday loss,
-                    # require near-perfect session regime score (3.5/4 = 87.5%).
-                    # Normal threshold is TRENDING_CONFIRMED (3/4 = 75%).
-                    # Evidence: Apr 20-24 second/third trades after a loss compounded losses.
-                    elif _session_had_loss and _session_regime_score < MID_SESSION_SCORE_FLOOR:
-                        logger.info(f"[MidSession] ENTRY BLOCKED: had loss today, score={_session_regime_score:.2f} "
-                                    f"< {MID_SESSION_SCORE_FLOOR:.3f} — need near-perfect trend for re-entry")
-                        tl.log_signal_blocked(now,
-                            f'MID_SESSION_DOUBLE_CONFIRM: score={_session_regime_score:.2f} < {MID_SESSION_SCORE_FLOOR:.3f}',
-                            row)
+                    elif _session_regime_label == 'RANGING':
+                        logger.info(f"[SessionRegime] ENTRY BLOCKED: RANGING score={_session_regime_score:.2f}")
+                        tl.log_signal_blocked(now, f'SESSION_REGIME: RANGING score={_session_regime_score:.2f}', row)
                         _entry_blocked = True
 
-                # Spot vs day-open filter (first 2 hours only, non-CRISIS-bypass).
-                # On Mar 23: spot opened -0.56% down, models signalled UP all morning —
-                # all 13 UP signals would have lost. The open price is the single best
-                # intraday reference for "has the market accepted direction yet?".
-                # After 11:15 (mod>120) the open is stale — reversal trades get blocked.
-                # CRISIS bypass exempt: V-recovery needs to fire against gap direction.
+                # Spot vs day-open filter — threshold raised to 0.5% (was 0.2%).
+                # 0.2% is noise-level and blocks valid signals on minor retracements.
+                # Only applies first 2 hours; CRISIS bypass exempt.
                 if not _entry_blocked and not _crisis_bypass and _day_open and _mod_now <= 120:
                     sig_dir      = signal.get('direction', 'UP')
                     spot_now_val = float(row.get('close', _day_open))
                     vs_open      = (spot_now_val - _day_open) / _day_open
-                    if sig_dir == 'UP' and vs_open < -0.002:
-                        logger.info(f"[Order] BLOCKED: spot {vs_open:.3%} below open — no CE buy while market below open")
+                    if sig_dir == 'UP' and vs_open < -0.005:
+                        logger.info(f"[Order] BLOCKED: spot {vs_open:.3%} below open — no CE buy")
                         _entry_blocked = True
-                    elif sig_dir == 'DOWN' and vs_open > 0.002:
-                        logger.info(f"[Order] BLOCKED: spot {vs_open:.3%} above open — no PE buy while market above open")
+                    elif sig_dir == 'DOWN' and vs_open > 0.005:
+                        logger.info(f"[Order] BLOCKED: spot {vs_open:.3%} above open — no PE buy")
                         _entry_blocked = True
 
                 # Affordability check: ATM premium > 70% of per-unit capital means
@@ -1471,13 +1371,12 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
                         logger.info(f"[Order] BLOCKED: ATM premium Rs{_atm_prem:.0f} > 70% of affordable Rs{_max_affordable:.0f} — OTM delta too low")
                         _entry_blocked = True
 
-                # Same-direction loss block: after a loss, block same direction for 10 bars.
-                # ~10 min pause lets the 1m model stop thrashing after a wrong-direction loss.
-                # Applies to all modes including CRISIS bypass.
+                # Same-direction loss block: 3 bars (was 10) after a loss in same direction.
+                # 10 bars missed best re-entry window on trending days.
                 if not _entry_blocked:
                     sig_dir = signal.get('direction', 'UP')
-                    if _last_loss_direction == sig_dir and (_bar_counter - _last_loss_bar) < 10:
-                        bars_left = 10 - (_bar_counter - _last_loss_bar)
+                    if _last_loss_direction == sig_dir and (_bar_counter - _last_loss_bar) < 3:
+                        bars_left = 3 - (_bar_counter - _last_loss_bar)
                         logger.info(f"[Order] BLOCKED: same-direction loss block dir={sig_dir} ({bars_left} bars remaining)")
                         _entry_blocked = True
 
@@ -1631,10 +1530,6 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
                                     _atm_prem_now = 200.0
                                 _trade_capital = _atm_prem_now * 65 * 1.05  # 1 lot + 5% buffer
                                 logger.info(f"[GapDay] Forcing 1L sizing: capital={_trade_capital:.0f}")
-                            elif _vix_halve_active:
-                                _trade_capital = capital * 0.5 * _size_mult_net
-                                logger.info(f"[VIXHalve] VIX={_pm_bias.vix_level:.1f} > {VIX_HALVE_THRESHOLD} "
-                                            f"— capital={_trade_capital:.0f} (halved × conf={_conf_mult:.2f} × weekly={_weekly_size_mult:.2f})")
                             else:
                                 _trade_capital = capital * _size_mult_net
 
@@ -1644,6 +1539,8 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
 
                         trade_info = select_option(signal, _trade_capital, now=now, tick_buffer=tick_buffer, session=session, position_mgr=ks, crisis_bypass=_crisis_bypass) if (signal and not _entry_blocked) else None
                     if trade_info:
+                        # Inject ATR at entry so MFE gate can scale threshold dynamically
+                        trade_info['atr_14'] = float(row.get('atr_14', 0))
                         # Execute order based on mode
                         if paper is not None and not paper.in_position:
                             # Paper mode - simulated trading
@@ -1776,6 +1673,9 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
                     # NOTE: trade dict key is 'pnl' (not 'pnl_pts' which doesn't exist)
                     _exit_pnl = float(last_t.get('pnl', last_t.get('pnl_rs', 0)))
                     _session_net_pnl += _exit_pnl
+                    # Record trade outcome in V5 risk state (updates daily loss,
+                    # consecutive-loss cooldown, and rolling WR guard).
+                    _v5_risk_state.record_trade(pnl_rs=_exit_pnl, won=_exit_pnl > 0)
                     # Rolling WR tracking — append result after each closed trade
                     _is_win = _exit_pnl > 0
                     _rolling_results.append(_is_win)
@@ -2066,9 +1966,9 @@ def live_loop(models: dict, regime_det: RegimeDetector, capital: float = 10000,
         elif regime_uncertain:
             effective_blocked = True
             effective_reason = f"REGIME_UNCERTAIN: awaiting confirmation bars"
-        elif drift_conf_mult == 0.0:
-            effective_blocked = True
-            effective_reason = f"FEATURE_DRIFT: confidence killed (OOD features: {drift_killed[:3]})"
+        elif drift_conf_mult < 1.0 and drift_killed:
+            effective_blocked = False
+            effective_reason = f"FEATURE_DRIFT: penalty {drift_conf_mult:.2f}x (OOD: {drift_killed[:3]})"
         else:
             effective_blocked = ks_blocked
             effective_reason = ks_reason

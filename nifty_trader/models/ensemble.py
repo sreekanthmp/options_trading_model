@@ -56,7 +56,7 @@ class MetaLabeler:
         vwap_dev_vel, pressure_ratio, bb_squeeze
     """
 
-    META_CONF_THRESH = 0.50   # relaxed: accept any meta-labeler majority
+    META_CONF_THRESH = 0.62   # raised from 0.50: filter requires genuine meta-labeler conviction
     META_FEATURES = [
         'proba_primary', 'regime', 'session_pct', 'iv_proxy',
         'atr_14_pct', 'adx_14', 'dmi_diff',

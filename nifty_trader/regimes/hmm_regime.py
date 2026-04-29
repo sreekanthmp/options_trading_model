@@ -490,9 +490,12 @@ class RegimeStateMachine:
         decay_factor    = 1.0 - np.exp(-bars_since_flip / (CONF_HALF_LIFE + 1e-9))
         effective_conf  = raw_confidence * decay_factor
 
-        # ---- 4. Return uncertain when a flip is pending ----------------------
-        if self.pending_count > 0 and not can_switch:
-            return REGIME_UNCERTAIN, effective_conf
+        # ---- 4. While a flip is pending, keep current confirmed regime --------
+        # Do NOT return UNCERTAIN during normal regime transitions — it blocks all
+        # signals for 3+ bars every time the HMM wobbles. Instead, hold the last
+        # confirmed regime until the new one has enough confirmation bars.
+        # UNCERTAIN is only meaningful if the HMM has no confident state at all
+        # (handled upstream in RegimeDetector), not during hysteresis.
 
         return self.current_regime, effective_conf
 

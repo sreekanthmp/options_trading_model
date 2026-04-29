@@ -492,29 +492,7 @@ def validate_spread_width(bid: float, ask: float, mid_price: float,
 
 
 def adjust_conf_for_flow(base_conf: float, fii_net: float, direction: str) -> float:
-    """
-    Reduce confidence if trading AGAINST strong institutional flow.
-    
-    WHY: FII selling >Rs2000 Cr/day often precedes 2-3 day declines.
-         Trading against this flow reduces edge.
-    
-    Args:
-        base_conf: Model's raw confidence
-        fii_net: FII net buy/sell in Crores (negative = selling)
-        direction: 'UP' or 'DOWN'
-    
-    Returns:
-        Adjusted confidence
-    """
-    if fii_net < -2000 and direction == 'UP':
-        # Heavy FII selling, going LONG -> reduce confidence
-        logger.info(f"[FII Flow] Heavy selling ({fii_net:.0f} Cr), reducing LONG confidence by 10%")
-        return base_conf * 0.90
-    elif fii_net > 2000 and direction == 'DOWN':
-        # Heavy FII buying, going SHORT -> reduce confidence
-        logger.info(f"[FII Flow] Heavy buying ({fii_net:.0f} Cr), reducing SHORT confidence by 10%")
-        return base_conf * 0.90
-    
+    """Stub — FII flow removed from feature set. Returns base_conf unchanged."""
     return base_conf
 
 

@@ -126,7 +126,7 @@ TB_MULT_TRENDING = {1: 1.2, 5: 1.8, 15: 2.2, 30: 2.8}
 TB_MULT_RANGING  = {1: 0.9, 5: 1.2, 15: 1.5, 30: 2.0}
 # Fallback for Crisis regime: 2x Ranging width
 TB_MULT_CRISIS   = {k: 2.0 * v for k, v in TB_MULT_RANGING.items()}
-TB_BARS          = {1: 10,  5: 30,  15: 12,  30: 12}  # Increased 30-min horizon bars to reduce saturation
+TB_BARS          = {1: 10,  5: 6,   15: 3,   30: 2}   # 5m×6=30min, 15m×3=45min, 30m×2=60min — all models predict within the 30–60min trade window
 TB_MIN_MOVE_PCT  = 0.20
 
 # ---------------------------------------------------------------------------
@@ -141,11 +141,11 @@ REGIME_ICONS    = {-1: "[WAIT]",    0: "[TREND]",  1: "[RANGE]", 2: "[CRISIS]"}
 # ---------------------------------------------------------------------------
 # Signal confidence thresholds
 # ---------------------------------------------------------------------------
-CONF_STRONG   = 0.96   # above this = suspect overfit; hard-capped in generator
-CONF_MODERATE = 0.92
+CONF_STRONG   = 0.75   # high-conviction label ceiling (within calibration clip [0.45, 0.82])
+CONF_MODERATE = 0.65   # moderate-conviction label floor (within calibration clip [0.45, 0.82])
 CONF_MIN      = 0.52   # relaxed: allow signals with modest model confidence
-CONF_BY_HORIZON = {1: 0.52, 5: 0.52, 15: 0.52, 30: 0.52}
-CONF_FLOOR_TRENDING = 0.52
+CONF_BY_HORIZON = {1: 0.52, 5: 0.52, 15: 0.57, 30: 0.57}
+CONF_FLOOR_TRENDING = 0.57  # FIX: raised from 0.52 — break-even after costs requires ~57% directional confidence; 52% is unprofitable after TOTAL_COST_PCT + slippage
 CONF_FLOOR_RANGING  = 0.52
 NO_TRADE_PCTILE_LOW  = 40
 NO_TRADE_PCTILE_HIGH = 60
@@ -181,7 +181,7 @@ DAILY_LOSS_LIMIT_RS = 1500.0
 # After 2 consecutive losses (any exit reason), block new entries for this many minutes.
 # Prevents revenge trading and loss-spiral on choppy days.
 # Evidence: Apr 20-24 losing streak — 3-4 consecutive same-day losses compounded losses.
-CONSEC_LOSS_COOLDOWN_MINS = 45
+CONSEC_LOSS_COOLDOWN_MINS = 15
 # Gap-day single-trade cap: when abs(gap_pct) > GAP_DAY_PCT, limit to 1 trade per day.
 # Apr 20: gap_pct=-2.14%, 3 trades taken, all 3 lost (-Rs 4,158). The model is directionally
 # confused on large gap days — the single best trade is allowed, then stop.
@@ -190,7 +190,7 @@ GAP_DAY_SINGLE_TRADE_PCT = 1.5   # 1.5% gap triggers 1-trade-only cap
 # switch to observation mode (no new entries) until market improves.
 # Prevents the system from trading into a regime it has no edge in.
 ROLLING_WR_WINDOW = 5    # look at last 5 completed trades
-ROLLING_WR_MIN    = 0.30  # if WR < 30% → observation mode (1.5 wins in last 5)
+ROLLING_WR_MIN    = 0.35  # if WR < 35% → observation mode; 31% is break-even at 1:2.2 R:R, buffer added
 # Pre-market skip-day thresholds (D1 checks — evaluated at session start)
 VIX_HALVE_THRESHOLD   = 22.0   # VIX > 22 → halve position size (use 0.5 lot multiplier)
 VIX_SKIP_THRESHOLD    = 999.0  # disabled — never skip day on VIX
@@ -444,3 +444,93 @@ PRESSURE_RATIO_DOWN_MIN = 0.0
 # No winner ever had MFE=0. This is the cleanest loss discriminator.
 MFE_CONFIRM_BARS = 2    # exit if option hasn't moved +3pts in our favour within 2 bars
 MFE_CONFIRM_PTS  = 3.0  # paper data: every loser had MFE=0, every winner had MFE>=3.07
+
+# ===========================================================================
+# V5 CLEAN SYSTEM — Trend-Following Signal Generator constants
+# ===========================================================================
+# Model horizons: 15-min and 30-min only.
+# 1m (54% acc) and 5m (56% acc) removed from direction voting — they add noise.
+V5_HORIZONS        = [15, 30]
+V5_HORIZON_WEIGHTS = {15: 0.60, 30: 0.40}
+
+# Triple-barrier aligned to 30-min trade window (on 5-min bars).
+# 6 bars × 5 min = 30 min horizon.  Asymmetric 2:1 barriers.
+V5_TB_H_BARS    = 6      # forward horizon in bars
+V5_TB_UPPER_PCT = 0.005  # +0.5% = upper barrier (win)
+V5_TB_LOWER_PCT = 0.003  # -0.3% = lower barrier (loss); asymmetric for 2:1 R:R
+
+# Signal confidence thresholds (v5)
+V5_CONF_ENTRY   = 0.60   # minimum P(direction) to generate a signal
+V5_CONF_STRONG  = 0.70   # high-conviction label
+
+# Entry time window (minute_of_day)
+V5_ENTRY_MOD_MIN = 15    # 09:30 — after first 15-min noise
+V5_ENTRY_MOD_MAX = 300   # 14:15 — leave 75 min before close for trade to develop
+
+# Regime detection (ADX-based)
+V5_ADX_TREND_THRESHOLD = 22.0   # ADX must be above this for TRENDING regime
+V5_ADX_PERIOD          = 20     # ADX smoothing period
+
+# Pullback-resume entry thresholds (EntryV5)
+V5_PB_VWAP_BAND_PCT  = 0.003   # ±0.3% of close = "in VWAP zone"
+V5_PB_MIN_IMPULSE_PCT = 0.008  # minimum 0.8% prior impulse move (10 bars)
+V5_PB_DEPTH_MIN      = 0.30    # pullback must retrace at least 30% of impulse
+V5_PB_DEPTH_MAX      = 0.70    # pullback must not retrace more than 70%
+V5_PB_MAX_WAIT_BARS  = 12      # expire setup if no pullback within 12 bars (~60 min)
+
+# Momentum resume thresholds
+V5_MOM_VWAP_VEL_MIN  = 0.08   # vwap_dev_vel magnitude (absolute) for resumption
+V5_MOM_TICK_IMB_MIN  = 0.15   # tick_imbalance magnitude for resumption
+
+# Risk parameters (unchanged from system design)
+V5_STOP_PCT   = 0.10   # 10% of premium
+V5_TARGET_PCT = 0.20   # 20% of premium (~2× stop)
+
+# IV rank filter: block when IV percentile is too high (overpriced options)
+V5_IV_RANK_MAX = 80.0  # block when IV rank > 80th percentile
+
+# ---------------------------------------------------------------------------
+# V5 SESSION-LEVEL RISK MANAGEMENT
+# ---------------------------------------------------------------------------
+
+# Maximum new entries per session.
+# After 3 trades, no further entries regardless of signal quality.
+# Caps total daily brokerage cost and prevents overtrading on bad days.
+V5_MAX_TRADES_DAY = 3
+
+# Hard daily loss limit in Rs.
+# Once cumulative session loss exceeds this amount, halt all new entries.
+# Rs 1,500 ≈ 2 full 10%-stop losses at 1 lot × Rs 230 ATM premium × 65 qty.
+# Purpose: survive a bad day with capital intact for tomorrow.
+V5_DAILY_LOSS_RS = 1500.0
+
+# Consecutive-loss cooldown.
+# After 2 losses in a row (any exit reason), block entries for this many minutes.
+# Prevents revenge-trading spiral: the 3rd entry on a failed setup is always the
+# worst one. Evidence: Apr-20 losing streak had 3-4 same-day consecutive losses.
+V5_CONSEC_LOSS_TRIGGER  = 2     # number of consecutive losses before cooldown fires
+V5_CONSEC_LOSS_COOLDOWN = 15    # minutes to wait before next entry is allowed
+
+# Rolling win-rate guard (last N closed trades).
+# If rolling WR < 35%, switch to observation mode until next session reset.
+# Rationale: breakeven WR at 2:1 R:R = 33.3%; 35% adds ~1.7pp buffer for costs.
+# The guard fires ONLY after the full window is filled (first V5_WR_WINDOW trades
+# are always allowed so the system can build a sample).
+V5_WR_WINDOW = 5     # rolling window length (completed trades)
+V5_WR_MIN    = 0.35  # pause if rolling WR drops below this
+
+# Gap-day single-trade cap.
+# If the session opening gap exceeds this % of prior close, the model's
+# feature distribution is distorted by fractional-diff memory. Allow only
+# the one best trade for that session then stop.
+# Evidence: Apr-20 gap=-2.14%, 3 trades, all 3 lost (-Rs 4,158).
+V5_GAP_DAY_PCT          = 1.5   # % gap that triggers the cap
+V5_GAP_DAY_MAX_TRADES   = 1     # trades allowed on a gap day
+
+# Position sizing
+# lots = floor(capital × V5_DEPLOY_PCT / (premium × V5_LOT_SIZE))
+# Halve when VIX > V5_VIX_HALVE_THRESHOLD (high-vol → options expensive).
+V5_DEPLOY_PCT          = 0.75   # 75% of capital as premium budget
+V5_MAX_LOTS            = 2      # hard ceiling regardless of capital
+V5_LOT_SIZE            = 65     # current NIFTY lot size
+V5_VIX_HALVE_THRESHOLD = 22.0   # VIX above this → halve lot count

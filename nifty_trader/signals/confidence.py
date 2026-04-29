@@ -183,6 +183,16 @@ def check_entry_micro_confirmation(row: pd.Series, direction: str,
         if direction == 'DOWN' and current_vwap_pos == 0:
             return True, "vwap_cross_trending_highconf"
 
+    # Rule 1d: Strong 5m trend — 1m ADX can collapse on slow drift days while 5m
+    # stays strongly directional (adx_5m>=60). When 5m structure is intact and
+    # price is on the correct VWAP side, 1-bar confirmation is sufficient.
+    adx_5m = float(row.get('tf5_adx', 0.0))
+    if adx_5m >= 60:
+        if direction == 'UP' and current_vwap_pos == 1:
+            return True, "vwap_5m_strong_trend"
+        if direction == 'DOWN' and current_vwap_pos == 0:
+            return True, "vwap_5m_strong_trend"
+
     # Rule 2: Strong directional candle (body > 0.3 x ATR)
     body = abs(close - open_price)
     if atr14 > 0 and body > 0.3 * atr14:

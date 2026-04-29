@@ -122,6 +122,7 @@ class PaperTrader:
             '_using_real_ltp':    False,
             # MFE tracking for zero-MFE early exit
             'mfe_running':        0.0,
+            'atr_14':             float(t.get('atr_14', 0.0)),
         }
 
         print(f"\n  [PAPER ENTRY]  {self._position['symbol']}  "
@@ -206,11 +207,17 @@ class PaperTrader:
                 # MFE_CONFIRM_BARS=2, MFE_CONFIRM_PTS=3.0 (from config.py — raised from 1.5).
                 # ---------------------------------------------------------------
                 gain_now = ltp - entry
-                p['mfe_running'] = max(p.get('mfe_running', 0.0), gain_now)
-                mfe = p.get('mfe_running', 0.0)
+                # NOTE: mfe_running is updated once below (after all early-exit gates).
+                # Reading it here to check against the MFE gate threshold.
+                mfe = max(p.get('mfe_running', 0.0), gain_now)
 
-                if hold_mins >= MFE_CONFIRM_BARS and mfe <= MFE_CONFIRM_PTS:
-                    print(f"  [MFEGate] {hold_mins:.0f} min, MFE={mfe:.2f} <= {MFE_CONFIRM_PTS} pts — trade never moved in our favour, exiting.")
+                # Scale MFE threshold with ATR so slow-drift days aren't killed too early.
+                # On volatile days (ATR=20) threshold=3.0; on slow days (ATR=8) threshold=1.2.
+                # Floor at 1.0 so the gate still fires on genuinely flat options.
+                atr_now = p.get('atr_14', MFE_CONFIRM_PTS / 0.15)
+                mfe_threshold = max(1.0, min(MFE_CONFIRM_PTS, atr_now * 0.15))
+                if hold_mins >= MFE_CONFIRM_BARS and mfe < mfe_threshold:
+                    print(f"  [MFEGate] {hold_mins:.0f} min, MFE={mfe:.2f} <= {mfe_threshold:.2f} pts (ATR={atr_now:.1f}) — no move, exiting.")
                     self._exit('ZERO_MFE_EXIT', ltp, now, ks, signal_state=signal_state, rng=rng)
                     return
 
@@ -347,7 +354,7 @@ class PaperTrader:
                 half_qty = qty // 2
                 half_pnl = (ltp - entry) * half_qty
                 p['qty']      = qty - half_qty
-                p['contracts'] = p['contracts'] // 2
+                p['contracts'] = max(1, p['contracts'] // 2)
                 p['stop']     = entry   # move stop to breakeven on remaining half
                 p['_partial_exited'] = True
                 print(f"  [PARTIAL TARGET] Booked {half_qty} qty at {ltp:.2f} "
@@ -368,7 +375,9 @@ class PaperTrader:
         #   3. Sustained: atr_ratio was also below 0.70 last bar (not a single-bar dip)
         #   4. Position is in a LOSS (pnl_pct < 0) — never exit profitable trades on squeeze
         if current_row is not None:
-            bars_open_now = int((now - p['entry_time']).total_seconds() / 60)
+            # bars_held is incremented each track() call — use it instead of wall-clock
+            # so expansion-failure gate works correctly in both live and replay modes.
+            bars_open_now = int(p.get('bars_held', 0))
             atr_ratio_now = float(current_row.get('atr_ratio', 1.0))
             pnl_pct = (ltp / entry - 1.0)
             prev_atr_ratio = float(p.get('_prev_atr_ratio', 1.0))

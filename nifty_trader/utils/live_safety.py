@@ -210,7 +210,7 @@ class LiveSafetyManager:
             logger.warning(f"[FeatureDrift] {warn_count} features drifting beyond {DRIFT_WARN_SIGMA} sigma")
 
         if max_z >= DRIFT_KILL_SIGMA:
-            conf_mult = 0.0   # kill signal entirely
+            conf_mult = 0.60  # 40% penalty; strong signals survive, marginal ones don't
         elif max_z >= DRIFT_BLOCK_SIGMA:
             conf_mult = 0.5   # halve confidence
         elif max_z >= DRIFT_WARN_SIGMA:

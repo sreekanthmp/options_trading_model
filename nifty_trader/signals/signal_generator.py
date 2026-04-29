@@ -1,5 +1,14 @@
 """
-Signal generation: SignalState tracking + generate_signal() (13-gate filter).
+Signal generation: v5 clean trend-following system.
+
+Strategy: TRENDING regime only → wait → pullback to VWAP → momentum resumes → enter.
+
+Gate structure (3 hard filters + ML + entry):
+  1. Regime:    TRENDING only  (ADX-based)
+  2. Session:   09:30–14:15 window
+  3. IV filter: iv_rank < 80th percentile (avoid overpriced options)
+  ML.           P(direction) ≥ 0.60 from 15m/30m models; direction must match regime
+  Entry:        Pullback-resume (price retraces to VWAP zone, momentum resumes)
 """
 import time, logging
 from datetime import datetime, timedelta, date
@@ -28,6 +37,15 @@ from ..config import (
     BLOCK_RANGING_REGIME, BLOCK_TRENDING_REGIME,
     ADX_ENTRY_MAX, ADX_CRISIS_MAX,
     PRESSURE_RATIO_DOWN_MIN,
+    # V5 clean system constants
+    V5_HORIZONS, V5_HORIZON_WEIGHTS,
+    V5_CONF_ENTRY, V5_CONF_STRONG,
+    V5_ENTRY_MOD_MIN, V5_ENTRY_MOD_MAX,
+    V5_IV_RANK_MAX,
+    V5_PB_VWAP_BAND_PCT, V5_PB_MIN_IMPULSE_PCT,
+    V5_PB_DEPTH_MIN, V5_PB_DEPTH_MAX, V5_PB_MAX_WAIT_BARS,
+    V5_MOM_VWAP_VEL_MIN, V5_MOM_TICK_IMB_MIN,
+    V5_STOP_PCT, V5_TARGET_PCT,
 )
 from ..execution.costs import effective_cost
 from ..utils.time_utils import calculate_time_decay_confidence
@@ -42,6 +60,7 @@ from .confidence import (
 from ..features.feature_engineering import FEATURE_COLS, FEATURE_LIVE_OK
 from ..execution.orders import _next_expiry_mins, estimate_option_premium, get_expiry_rule
 from ..models.ensemble import MetaLabeler
+from ..execution.v5_risk import V5RiskState, v5_lot_size, _v5_risk_state
 
 logger = logging.getLogger(__name__)
 
@@ -60,31 +79,6 @@ def _block(reason: str):
     global last_block_reason
     last_block_reason = reason
     return None
-
-
-def calibrate_conf(conf: float) -> float:
-    """
-    Fallback confidence mapping for use when Platt-calibrated models are not
-    yet available (e.g. before first retrain after deploying calibration code).
-
-    Maps overconfident raw probabilities (0.85-0.95 range) to realistic
-    values consistent with observed 55-65% accuracy on NIFTY intraday signals.
-
-    This is a one-time bridge: once the model is retrained with
-    _CalibratedWrapper (trainer.py), this function is bypassed because
-    predict_proba already returns calibrated probabilities in [0.45, 0.82].
-
-    Usage: only call this on raw model output BEFORE penalty deductions.
-    Never apply it to an already-calibrated output (double-calibration degrades quality).
-    """
-    if conf > 0.90:
-        return 0.62
-    elif conf > 0.80:
-        return 0.60
-    elif conf > 0.70:
-        return 0.58
-    else:
-        return 0.55
 
 
 def validate_model_inputs(row: pd.Series, active_features: list) -> tuple:
@@ -171,6 +165,18 @@ class SignalState:
         # FIX: Use deque with maxlen to prevent unbounded growth in long-running VPS process
         self.vwap_history = deque(maxlen=100)  # Only keep last 100 positions
 
+        # Pullback-resume entry state (v4.0)
+        # After a "trend identified" signal fires, we wait for price to pull back
+        # into the VWAP zone before taking the actual entry on resumption.
+        # _pb_direction: direction of the pending setup ('UP', 'DOWN', or None)
+        # _pb_bars_since_signal: bars elapsed since trend was identified
+        # _pb_touched_vwap: True once price entered the VWAP zone (within 1 ATR)
+        # _pb_max_bars: discard setup if pullback never arrives within this many bars
+        self._pb_direction: str | None = None
+        self._pb_bars_since_signal: int = 0
+        self._pb_touched_vwap: bool = False
+        self._pb_max_bars: int = 12   # ~12 min; after that the setup expires
+
     def reset_day(self):
         """Reset intraday counters at start of new session."""
         self.trades_today = {'UP': 0, 'DOWN': 0}
@@ -186,6 +192,10 @@ class SignalState:
         # Reset horizon performance weights daily — yesterday's win/loss record
         # must not bias today's horizon weighting (different market context each day).
         self.perf_weights = dict(HORIZON_WEIGHTS)
+        # Reset pullback-resume entry state
+        self._pb_direction = None
+        self._pb_bars_since_signal = 0
+        self._pb_touched_vwap = False
     
     def in_cooldown(self) -> bool:
         """Edge Case 2: Post-Trade Cooldown (Anti-Churn).
@@ -336,22 +346,18 @@ class SignalState:
 
     def update_staleness(self, micro_regime: str, direction: str) -> float:
         """
-        Staleness penalty (Req 14): apply confidence decay when micro-regime
-        flips against the trade or momentum confirmation disappears.
-        Returns penalty to subtract from confidence.
+        Staleness penalty: decay confidence when micro-regime flips against the trade.
+        Trend-only: only penalises when micro_regime directly opposes direction.
+        The old 'momentum_gone' (RANGING) branch has been removed — RANGING
+        micro_regime cannot be reached in trend-only mode (Gate1 hard-blocks it).
         """
         is_against = (
             (direction == 'UP'   and micro_regime == 'TRENDING_DN') or
             (direction == 'DOWN' and micro_regime == 'TRENDING_UP')
         )
-        momentum_gone = micro_regime == 'RANGING'
-
         if is_against:
             self._stale_conf_penalty = min(0.15, self._stale_conf_penalty + 0.05)
-        elif momentum_gone:
-            self._stale_conf_penalty = min(0.08, self._stale_conf_penalty + 0.02)
         else:
-            # Decay penalty when conditions normalise
             self._stale_conf_penalty = max(0.0, self._stale_conf_penalty - 0.01)
 
         self._last_micro_regime = micro_regime
@@ -369,51 +375,52 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
                     crisis_bypass: bool = False,
                     regime_conf: float = 0.5) -> dict | None:
     """
-    v3.3 EV-First Signal Generation.
+    v4.1 Pure Trend-Following Signal Generation.
 
-    Confidence floors (CONF_BY_HORIZON):
-      1m=0.70, 5m=0.65, 15m=0.65, 30m=0.68
-      1m/5m floors are intentionally high so 15m/30m dominate the weighted vote.
+    Strategy: TRENDING regime only → wait → pullback to VWAP → momentum resumes → enter.
+
+    Direction source: 15m/30m ML weighted vote (authoritative).
+    TA role: veto only at extreme opposition (|ta_score| > 0.85); soft penalty below that.
+
+    Removed in v4.1 (non-trend logic):
+      - RANGING conf_floor (range-trading)
+      - Gate7b opposing micro-regime penalty (anti-trend fade)
+      - staleness momentum_gone branch (RANGING-specific)
+      - liq_sweep penalties (reversal/fade instinct)
+      - nr7 + flat struct penalties (range contraction)
+      - MomPenalty flat ret_5m (superseded by EntryV4)
+      - Gate11b dead-air penalty (superseded by EntryV4)
+      - FinalSelect ret_5m redundant check
 
     Signal gates (ALL must pass in order):
-      0.  Post-trade cooldown:  15-min anti-churn lock after each exit
-                                [CRISIS bypass: skipped]
-      1.  Regime gate:          not CRISIS (unless crisis_bypass=True from kill-switch)
-      2.  Session gate:         mod < 335 (14:50 cutoff) AND sp <= 0.92
-      3.  Lunch penalty:        12:15-13:00 → -0.05 conf penalty (not hard veto)
-      4.  Expiry zone gate:     zone2 (11:30-12:59) and zone4 (14:50+) blocked on Tuesday expiry
-      5.  IV floor:             iv_proxy >= 0.05 (market must have enough vol for options)
-      5b. Black swan gap gate:  gap > 2.5x day ATR AND mod < 45 → block 45 min
-      6.  Temporal gate:        5m prediction flipped twice in last 3 bars → lock 3 bars
-                                [was 1m before v3.3 — 1m is too noisy]
-                                [CRISIS bypass: skipped]
-      3b. TA/ML agreement:      |ta_score| > 1.0 opposing ML → hard veto;
-                                mild opposition → graded confidence penalty (max -0.04)
-      7.  Micro-regime conf floor: TRENDING>=0.52, RANGING>=0.52
-                                + extra_conf_floor (tuesday/lunch now reduce conf, not floor)
-      7a. RANGING horizon gate: RANGING regime requires 15m or 30m conviction
-                                (conf >= CONF_BY_HORIZON[h]); 1m/5m-only signals blocked
-                                [CRISIS bypass: skipped]
-      7b. Micro-regime direction: TRENDING_UP → only UP signals; TRENDING_DN → only DOWN
-                                [CRISIS bypass: skipped]
-      7c-ADX. Flat market:      adx < 20 → hard block (no directional structure)
-                                [CRISIS bypass: skipped]
-      7c-SQ-ADX. Squeeze+weak: bb_squeeze=1 AND adx < 30 → hard block (theta wins)
-                                [CRISIS bypass: skipped; BREAKOUT micro: skipped]
-      7c. Volatility expansion: bb_squeeze=1 AND atr_ratio < floor → hard block
-      7d. Staleness penalty:    micro-regime opposes direction → up to -0.15 conf decay
-                                [CRISIS bypass: skipped]
-      7e. IV crush protector:   iv_rank>85 AND iv contracting → -0.10 conf penalty
-      8.  Percentile gate:      conf_pctile < 40 → graded penalty (max -0.05);
-                                40-60 ambiguous band → hard veto
-                                [bootstrap: skipped until 20 samples in history]
-      8b. MetaLabeler gate:     P(primary_correct) >= 0.55 required
-                                [CRISIS bypass: skipped]
-      9.  EV_net gate:          EV_raw - costs*safety*spread_penalty > 0
-      10. Signal scarcity:      daily direction limit (disabled: 999/direction)
-      11. Time-decay floor:     late-day (mod>=315) requires 10% higher conf floor
-      12. Micro-confirmation:   2 consecutive bars same side of VWAP OR strong candle body
-                                [CRISIS bypass: skipped]
+      1.  Regime:          TRENDING only (RANGING/UNCERTAIN/CRISIS hard-blocked unless bypass)
+      2.  Session:         mod < 335 AND sp <= 0.92
+      2b. Regime conf:     HMM certainty floor (hard block < 0.10, penalty 0.10–0.55)
+      2c. Feature guard:   ret5m_fd/ret15m_fd != 0 (pipeline sanity)
+      2d. Time window:     soft −0.05 outside 09:45–14:45
+      2e. DOWN-only mode:  optional CE block (config flag)
+      3.  Lunch penalty:   12:15–13:00 → −0.05 conf
+      4.  Expiry zones:    zone2/4 blocked; zone2 trend-override at ADX≥30
+      5.  IV floor:        iv_proxy ≥ 0.10
+      5b. Gap shock:       gap > 2.5×ATR AND mod < 45 → block
+      5c. Gap direction:   counter-gap entries blocked until mod 150
+      5d. Premium floor:   ATM premium ≥ Rs 30 (Rs 20 on expiry)
+      6.  Temporal gate:   5m flip twice in 3 bars → −0.08 conf penalty
+      ML. Voting:          15m/30m weighted vote → direction (1m/5m temporal only)
+      3b. TA opposition:   |ta_score| > 0.85 → hard veto; lower → graded penalty
+      7.  Conf floor:      TRENDING micro ≥ CONF_FLOOR_TRENDING else CONF_MIN
+      7a. Long-horizon:    neither 15m/30m above floor → −0.05
+      7c-ADX. Structure:   adx < 12 → hard block; adx < 20 + contracting slope → penalty
+      7c-SQ. Squeeze:      bb_squeeze + weak ADX/ATR → up to −0.10
+      7d. Staleness:       micro opposes direction → up to −0.15 (trend flip scenario only)
+      7e. ORB:             ORB opposite direction in first 30 min → hard block
+      7f. IV crush:        iv_rank > 85 + contracting → −0.10
+      8b. MetaLabeler:     < 0.45 → −0.05; 0.45–0.55 → −0.08
+      9.  EV gate:         ev_net ≤ −0.05 → hard block; marginal → penalty
+      10. Scarcity:        daily direction cap
+      12. EntryV4:         pullback-resume — Phase 1 trend identified, Phase 2 VWAP
+                           retest + vwap_dev_vel/tick_imbalance resumption → ENTER
+                           [CRISIS bypass: skipped]
     """
     ss = signal_state if signal_state is not None else _signal_state
 
@@ -424,22 +431,10 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
     # Gate 0: Post-trade cooldown removed — signal gates already filter re-entries.
     # Conf floor, agreement, regime, micro-confirmation prevent bad re-entries.
 
-    # Gate 1: Crisis — blocked unless kill-switch bypass conditions were already met
-    if current_regime == REGIME_CRISIS and not crisis_bypass:
-        return _block("[Gate1] BLOCKED: CRISIS regime")
-
-    # Gate 1b: RANGING regime hard block.
-    # Paper data: 5 trades in RANGING, WR=0%, -Rs 2,100 gross loss. Zero evidence of
-    # edge in ranging. CRISIS bypass exempt — V-recovery fires out of CRISIS into any regime.
-    if BLOCK_RANGING_REGIME and current_regime == REGIME_RANGING and not crisis_bypass:
-        return _block("[Gate1b] BLOCKED: RANGING regime — no edge in range-bound market (WR=0% in 31-trade sample)")
-
-    # Gate 1c: TRENDING regime hard block.
-    # Paper data: 5 trades in TRENDING, WR=0%, all losses, -Rs 1,600 gross.
-    # 6 of 7 all-time winners were CRISIS regime. TRENDING has shown zero live edge.
-    # CRISIS bypass exempt — V-recovery fires out of CRISIS into any regime label.
-    if BLOCK_TRENDING_REGIME and current_regime == REGIME_TRENDING and not crisis_bypass:
-        return _block("[Gate1c] BLOCKED: TRENDING regime — no live edge (WR=0% in 5 trades, all losses)")
+    # Gate 1: Pure trend-following — only trade TRENDING or CRISIS (bypass) regime.
+    # RANGING, UNCERTAIN and all other regimes are hard-blocked: no edge in non-trending markets.
+    if not crisis_bypass and current_regime != REGIME_TRENDING:
+        return _block(f"[Gate1] BLOCKED: regime={REGIME_NAMES.get(current_regime,'?')} — only TRENDING regime allowed")
 
     sp  = row.get('session_pct', 0)
     mod = int(row.get('minute_of_day', 0))
@@ -458,9 +453,9 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
     # At 0.30 the gate only catches near-random regime calls; 0.60 requires genuine
     # regime clarity before entering a position.
     if not crisis_bypass:
-        if regime_conf < 0.45:
-            return _block(f"[Gate2b] BLOCKED: regime_conf={regime_conf:.2f} < 0.45 — regime too uncertain")
-        # 0.45–0.55: HMM uncertain but not random — apply small penalty instead of blocking
+        if regime_conf < 0.10:
+            return _block(f"[Gate2b] BLOCKED: regime_conf={regime_conf:.2f} < 0.10 — regime too uncertain")
+        # 0.10–0.55: HMM uncertain but not random — apply small penalty instead of blocking
         _regime_conf_penalty = 0.04 if regime_conf < 0.55 else 0.0
     else:
         _regime_conf_penalty = 0.0
@@ -585,18 +580,13 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
     if gap_pct > 2.5 * day_atr and mod < 45:
         return _block(f"[Gate5b] BLOCKED: black swan gap ({gap_pct:.2f}% > 2.5x ATR={day_atr:.2f}%)")
 
-    # Gate 5c — Directional Gap Filter:
-    # On significant gap-down days (gap < -1.0%), the market has established a
-    # bearish context. Buying CE (UP) against this context during the first
-    # 90 minutes is a "buy the dip" bet that statistically fails — the model
-    # sees oversold RSI and fires UP signals but the trend continues down.
-    # Similarly, on gap-up days block PE buys in the first 90 mins.
-    # CRISIS bypass does NOT skip this — it's a price-reality filter.
-    # Threshold -1.0% / +1.0% catches meaningful gaps without over-filtering.
-    # Extended to mod<=150 (11:45 AM) — Mar 19 showed UP losses at mod=122-133
-    # (11:17-11:28 AM), just past the old 10:45 cutoff. Gap-down mornings don't
-    # reverse until midday; 2.5 hours allows market to find actual direction.
-    # NOTE: Gate 5c check moved below voting block (direction must be known first).
+    # Gate 5c — Directional Gap Filter (trend-aligned, v4.1):
+    # A large gap establishes the day's dominant trend direction.
+    # Trading AGAINST the gap in the first 150 min is counter-trend — blocked.
+    # Trading WITH the gap is allowed (trend continuation in gap direction).
+    # This is NOT mean-reversion logic; it enforces trend alignment.
+    # CRISIS bypass does NOT skip — it's a price-reality filter.
+    # NOTE: Gate 5c check is below the voting block (direction must be known first).
 
     # Gate 6: Temporal consistency gate (Req 5)
     # SOFT PENALTY: 1m direction flip twice in last 3 bars now applies a confidence
@@ -821,13 +811,36 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
     if n_valid == 0 or total_weight == 0:
         return _block("[Gate] BLOCKED: no valid horizon votes")
 
-    # Directional decision
-    if weighted_up > weighted_dn:
-        direction = 'UP';   agreement = weighted_up / (weighted_up + weighted_dn)
-    else:
-        direction = 'DOWN'; agreement = weighted_dn / (weighted_up + weighted_dn)
+    # v4.0: ML sets direction; TA is a soft confirmation, NOT the gatekeeper.
+    #
+    # WHY: ta_overall_score is built from RSI(14), DMI(14), MACD(12,26) — all
+    # lagging by 8–14 bars. Using TA to SET direction guarantees the direction
+    # call is stale before entry. The 15m/30m ML models are the authoritative
+    # direction source; TA's role is to flag extreme opposition only.
+    #
+    # Hard veto (Gate 3b, later in pipeline) still fires at |ta_score| > 0.85.
+    # Mild TA opposition (0 < |ta_score| <= 0.85) becomes a soft penalty.
+    # ta_overall_score == 0 is no longer a block — it means TA is neutral,
+    # which is fine for early-trend entries where lagging indicators haven't
+    # flipped yet.
+    _ta_dir_score = float(row.get('ta_overall_score', 0.0))
+    _ml_dir = 'UP' if weighted_up > weighted_dn else 'DOWN'
+    direction = _ml_dir
+    _ml_disagrees = False   # TA/ML mismatch penalty applied in Gate 3b below
 
-    logger.debug(f"[Vote] w_up={weighted_up:.4f} w_dn={weighted_dn:.4f} dir={direction} agree={agreement:.3f} n={n_valid}")
+    # VWAP alignment gate removed (v4.0).
+    # The pullback-resume entry (Gate 12 / EntryV4) now handles VWAP positioning:
+    # it waits for price to retest the VWAP zone and enter on resumption.
+    # Keeping a hard "price must be on correct side" gate here would block Phase 2
+    # entries where price legitimately touches VWAP during the pullback.
+
+    # Agreement = ML vote share in direction (confidence proxy)
+    if direction == 'UP':
+        agreement = weighted_up / (weighted_up + weighted_dn) if (weighted_up + weighted_dn) > 0 else 0.5
+    else:
+        agreement = weighted_dn / (weighted_up + weighted_dn) if (weighted_up + weighted_dn) > 0 else 0.5
+
+    logger.debug(f"[Vote] w_up={weighted_up:.4f} w_dn={weighted_dn:.4f} ta_score={_ta_dir_score:+.3f} ml_dir={_ml_dir} agree={agreement:.3f} n={n_valid}")
 
     # Agreement threshold: two-tier.
     # < 0.52: genuine tie or inverted consensus — hard block (coin-flip has negative EV after costs)
@@ -838,6 +851,9 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
         return _block(f"[Gate] BLOCKED: agreement={agreement:.2f} < 0.52 (no majority)")
     # Store weak-agreement penalty for application in confidence flow below
     _agreement_weak_penalty = 0.03 if agreement < 0.55 else 0.0
+
+    # Gate 2f removed — pure trend-following: ML direction is authoritative.
+    # TA score used only as a soft penalty (Gate 3b) not a direction override.
 
     # Gate 2e (post-vote): DOWN-only mode — block CE (UP) direction.
     if DOWN_ONLY_MODE and not crisis_bypass and direction == 'UP':
@@ -983,14 +999,30 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
         logger.debug(f"[Gate3-AGR] weak agreement penalty=-{_agreement_weak_penalty:.2f} (agree={agreement:.3f}) conf={conf:.3f}")
 
     # --- Gate 3-DA: directional agreement penalty (pre-computed above) -------
-    if _temporal_penalty > 0 or _dir_agree_penalty > 0:
-        conf -= (_temporal_penalty + _dir_agree_penalty)
+    _ml_align_penalty = 0.06 if _ml_disagrees else 0.0
+    if _temporal_penalty > 0 or _dir_agree_penalty > 0 or _ml_align_penalty > 0:
+        conf -= (_temporal_penalty + _dir_agree_penalty + _ml_align_penalty)
         logger.debug(f"[Penalty] temporal={_temporal_penalty:.3f} dir_agree={_dir_agree_penalty:.3f} "
-                     f"conf={conf:.3f}")
+                     f"ml_align={_ml_align_penalty:.3f} conf={conf:.3f}")
+
+    # --- Pullback phase detection -------------------------------------------
+    # When EntryV4 has registered a direction and is actively tracking a pullback
+    # (ss._pb_direction == direction), TA weakening, ADX contraction, and staleness
+    # are EXPECTED artifacts of the pullback itself — not evidence of a bad setup.
+    # Applying these penalties during pullback bars pushes conf below floor on the
+    # ideal entry bar (at VWAP zone low), forcing late entry at the resumption spike.
+    # Fix: suppress these three soft penalties during tracked pullback bars.
+    # Hard vetoes (TA > 0.85, ADX < 12) are preserved regardless.
+    _in_tracked_pullback = (ss._pb_direction is not None and ss._pb_direction == direction)
+    if _in_tracked_pullback:
+        logger.debug(f"[PullbackPhase] active pullback tracking for {direction} — "
+                     f"suppressing TA/ADX/staleness soft penalties (bar {ss._pb_bars_since_signal})")
 
     # --- Gate 3b: TA/ML opposition -------------------------------------------
     # Hard veto only at abs_ta > 0.85 (near-certain directional contradiction).
     # Everything below that is a graded penalty.
+    # During tracked pullback: soft penalty suppressed — TA naturally opposes during
+    # pullback (RSI/MACD weaken as price retraces) and is expected, not a bad signal.
     ta_score  = float(row.get('ta_overall_score', 0.0))
     bb_sq_now = int(row.get('bb_squeeze', 0))
     ta_opposes = (direction == 'DOWN' and ta_score > 0) or (direction == 'UP' and ta_score < 0)
@@ -998,9 +1030,10 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
         abs_ta = abs(ta_score)
         if abs_ta > 0.85:
             return _block(f"[Gate3b] BLOCKED: TA strong opposition — ML={direction} but TA={ta_score:+.3f}")
-        ta_penalty = 0.08 if bb_sq_now == 1 else abs_ta * 0.06
-        conf -= ta_penalty
-        logger.debug(f"[Gate3b] TA penalty={ta_penalty:.3f} (ta={ta_score:+.3f} squeeze={bb_sq_now}) conf={conf:.3f}")
+        if not _in_tracked_pullback:
+            ta_penalty = 0.08 if bb_sq_now == 1 else abs_ta * 0.06
+            conf -= ta_penalty
+            logger.debug(f"[Gate3b] TA penalty={ta_penalty:.3f} (ta={ta_score:+.3f} squeeze={bb_sq_now}) conf={conf:.3f}")
 
     # --- Tuesday / expiry confidence penalty (context adjustment) ------------
     # Applied as a penalty to conf rather than inflation of the floor.
@@ -1020,11 +1053,11 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
         conf -= lunch_penalty
         logger.debug(f"[Penalty] lunch={lunch_penalty:.3f} conf={conf:.3f}")
 
-    # conf_floor is now the regime/expiry base floor only — no stacked additions.
+    # Trend-only: a single conf_floor regardless of micro_regime sub-state.
+    # RANGING micro_regime cannot reach here (Gate1 already hard-blocks RANGING regime;
+    # UNCERTAIN is also blocked). CONF_FLOOR_RANGING is pure range-trading logic — removed.
     is_trending = micro_regime in ('TRENDING_UP', 'TRENDING_DN', 'BREAKOUT')
-    is_ranging  = micro_regime == 'RANGING'
-    conf_floor  = (CONF_FLOOR_TRENDING if is_trending else
-                   CONF_FLOOR_RANGING  if is_ranging  else CONF_MIN)
+    conf_floor  = CONF_FLOOR_TRENDING if is_trending else CONF_MIN
     conf_floor += extra_conf_floor   # regime-frequency boost from live.py
     if _is_expiry:
         conf_floor = max(conf_floor, EXPIRY_CONF_FLOOR)
@@ -1041,39 +1074,11 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
             conf -= 0.05
             logger.debug(f"[Gate7a] neither 15m/30m individually above floor — penalty=-0.05 conf={conf:.3f}")
 
-    # --- Gate 7b: micro-regime direction alignment (soft penalty) ------------
-    # Was a hard block; converted so early trend reversals are not excluded.
-    # Micro-regime (1m lagging) opposing direction = start of a new trend move.
-    if is_trending and not crisis_bypass:
-        if (direction == 'UP' and micro_regime == 'TRENDING_DN') or \
-           (direction == 'DOWN' and micro_regime == 'TRENDING_UP'):
-            conf -= 0.06
-            logger.debug(f"[Gate7b] micro opposes direction penalty=-0.06 "
-                         f"(micro={micro_regime} dir={direction}) conf={conf:.3f}")
-
-    # --- Gate 7b2: trend exhaustion (hard block — price reality) -------------
+    # Gate 7b removed (trend-only, v4.1):
+    # micro_regime opposing direction = start of a NEW trend — this is exactly the
+    # pullback-resume scenario we want to trade. Penalising it was mean-reversion logic.
+    # The pullback-resume entry (EntryV4) handles this correctly via vwap_dev_vel + tick_imb.
     adx_val = float(row.get('adx_14', 0.0))
-    rsi_val = float(row.get('rsi_14', 50.0))
-    if adx_val > 45:
-        if direction == 'UP' and rsi_val > 75:
-            return _block(f"[Gate7b2] BLOCKED: trend exhausted ADX={adx_val:.1f} RSI={rsi_val:.1f} — chasing UP")
-        if direction == 'DOWN' and rsi_val < 25:
-            return _block(f"[Gate7b2] BLOCKED: trend exhausted ADX={adx_val:.1f} RSI={rsi_val:.1f} — chasing DOWN")
-
-    # --- Gate 7b3: RSI extreme penalty ---------------------------------------
-    # Capped at 0.06 (was 0.08) to reduce overlap with staleness penalty below.
-    # RSI extreme + micro-regime opposing = same information (lagging price reversal).
-    # Combined RSI+stale is capped after stale computation — see cap block below.
-    rsi_penalty = 0.0
-    if not crisis_bypass:
-        if direction == 'DOWN' and rsi_val < 35:
-            rsi_penalty = min(0.06, (35 - rsi_val) / 35 * 0.10)
-            conf -= rsi_penalty
-            logger.debug(f"[Gate7b3] RSI oversold penalty={rsi_penalty:.3f} (rsi={rsi_val:.1f}) conf={conf:.3f}")
-        elif direction == 'UP' and rsi_val > 65:
-            rsi_penalty = min(0.06, (rsi_val - 65) / 35 * 0.10)
-            conf -= rsi_penalty
-            logger.debug(f"[Gate7b3] RSI overbought penalty={rsi_penalty:.3f} (rsi={rsi_val:.1f}) conf={conf:.3f}")
 
     # --- Gate 7d-PR: pressure ratio for DOWN (hard block when enabled) -------
     if direction == 'DOWN':
@@ -1081,60 +1086,73 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
         if _pr > 0 and _pr < PRESSURE_RATIO_DOWN_MIN:
             return _block(f"[Gate7d-PR] BLOCKED: pressure_ratio={_pr:.2f} < {PRESSURE_RATIO_DOWN_MIN} for DOWN")
 
-    # --- Gate 7e: price structure alignment (soft penalties) -----------------
-    # ORB opposition in first 30 min retained as hard block (strongest early edge).
+    # --- Gate 7e: ORB alignment (trend-only, v4.1) ----------------------------
+    # Removed (trend-following rationale):
+    #   liq_sweep_up/dn penalties: a sweep of a prior high in an UP trend IS the
+    #     continuation move — penalising it is a reversal/fade instinct, not trend-following.
+    #   struct_bear/struct_bull penalties: bearish structure in an UP trend is the
+    #     pullback zone EntryV4 is designed to enter FROM. Penalising it is wrong.
+    #   nr7 (narrow-range-7): range contraction before a breakout is a SETUP, not a penalty.
+    #
+    # Retained: ORB hard-block in the first 30 min — price has already broken out
+    # in the opposite direction; the opening structure is the dominant trade.
     if not crisis_bypass:
-        _struct  = float(row.get('struct_score', 0.0))
-        _fvg_b   = int(row.get('fvg_bull', 0))
-        _fvg_r   = int(row.get('fvg_bear', 0))
-        _lsw_up  = int(row.get('liq_sweep_up', 0))
-        _lsw_dn  = int(row.get('liq_sweep_dn', 0))
-        _nr7     = int(row.get('nr7', 0))
-        _orb_up  = int(row.get('or_break_up', 0))
-        _orb_dn  = int(row.get('or_break_dn', 0))
-        _struct_penalties = []
+        _orb_up = int(row.get('or_break_up', 0))
+        _orb_dn = int(row.get('or_break_dn', 0))
+        if _orb_dn == 1 and direction == 'UP' and mod < 30:
+            return _block(f"[Gate7e] BLOCKED: ORB=DN, UP in first 30 min (mod={mod})")
+        if _orb_up == 1 and direction == 'DOWN' and mod < 30:
+            return _block(f"[Gate7e] BLOCKED: ORB=UP, DOWN in first 30 min (mod={mod})")
+        logger.debug(f"[Gate7e] ORB check: orb_up={_orb_up} orb_dn={_orb_dn} dir={direction} mod={mod}")
 
-        if direction == 'UP' and _lsw_up == 1:
-            conf -= 0.07; _struct_penalties.append("lsw_up(-0.07)")
-        if direction == 'DOWN' and _lsw_dn == 1:
-            conf -= 0.07; _struct_penalties.append("lsw_dn(-0.07)")
-        if direction == 'UP' and _struct < -0.5 and _fvg_b == 0:
-            conf -= 0.06; _struct_penalties.append(f"struct_bear({_struct:.2f})(-0.06)")
-        if direction == 'DOWN' and _struct > 0.5 and _fvg_r == 0:
-            conf -= 0.06; _struct_penalties.append(f"struct_bull({_struct:.2f})(-0.06)")
-        if _nr7 == 1 and _orb_up == 0 and _orb_dn == 0 and abs(_struct) < 0.5:
-            conf -= 0.05; _struct_penalties.append("nr7(-0.05)")
-        if _orb_dn == 1 and direction == 'UP':
-            if mod < 30:
-                return _block(f"[Gate7e] BLOCKED: ORB=DN, UP in first 30 min (mod={mod})")
-            elif mod < 135:
-                conf -= 0.06; _struct_penalties.append("orb_dn_vs_up(-0.06)")
-        if _orb_up == 1 and direction == 'DOWN':
-            if mod < 30:
-                return _block(f"[Gate7e] BLOCKED: ORB=UP, DOWN in first 30 min (mod={mod})")
-            elif mod < 135:
-                conf -= 0.06; _struct_penalties.append("orb_up_vs_dn(-0.06)")
-
-        if _struct_penalties:
-            logger.debug(f"[Gate7e] penalties: {', '.join(_struct_penalties)} conf={conf:.3f}")
-        else:
-            logger.debug(f"[Gate7e] no penalty (struct={_struct:.2f} nr7={_nr7} orb_up={_orb_up} orb_dn={_orb_dn})")
-
-    # --- Gate 7c-ADX: flat/dead market (hard block <12, soft penalty 12-20) --
+    # --- Gate 7c-ADX: flat/dead market — slope-based (v4.0) -------------------
+    # v4.0 change: replace ADX LEVEL floor with ADX SLOPE check.
+    #
+    # WHY: ADX(14) lags momentum bursts by ~7 bars. Requiring adx >= 20 means
+    # the trend has been running for 7+ bars before entry is allowed — exactly
+    # the late-entry problem. A RISING ADX of 16 is a far better entry than a
+    # FALLING ADX of 24 (which signals momentum exhaustion).
+    #
+    # New rule:
+    #   Hard block: adx < 12 (truly dead, no structure at all) — unchanged.
+    #   Slope check: adx_slope_3b = adx_14[t] - adx_14[t-3]. If slope <= 0
+    #                AND adx < 20, momentum is contracting → soft penalty.
+    #   Rising ADX (slope > 0): no penalty regardless of level above 12.
+    #   5m strong trend override: unchanged (adx_5m >= 60 skips 1m checks).
     atr_ratio  = float(row.get('atr_ratio', 1.0))
     bb_squeeze = int(row.get('bb_squeeze', 0))
-    vol_floor  = 0.70 if is_ranging else 0.85
+    vol_floor  = 0.85   # trend-only: no RANGING regime, single ATR floor
+    adx_5m_val = float(row.get('tf5_adx', 0.0))
+    _5m_strong_trend = adx_5m_val >= 60 and current_regime == REGIME_TRENDING
+    # adx_slope_3b: change in 1m ADX over the last 3 bars (positive = rising).
+    # Stored as a feature 'adx_slope' if available; compute on-the-fly otherwise.
+    _adx_slope_3b = float(row.get('adx_slope', float('nan')))
+    if np.isnan(_adx_slope_3b):
+        # Fallback: feature not in row (old model) — treat as neutral (0)
+        _adx_slope_3b = 0.0
     if not crisis_bypass:
-        if adx_val < 10:
-            return _block(f"[Gate7c-ADX] BLOCKED: adx={adx_val:.1f} < 10 — no directional structure")
-        elif adx_val < 18:
-            adx_penalty = (18 - adx_val) / 18 * 0.10
-            conf -= adx_penalty
-            logger.debug(f"[Gate7c-ADX] weak ADX penalty={adx_penalty:.3f} (adx={adx_val:.1f}) conf={conf:.3f}")
+        adx_for_filter = adx_5m_val if adx_5m_val > 0 else adx_val
+        if adx_for_filter < 12 and not _5m_strong_trend:
+            return _block(f"[Gate7c-ADX] BLOCKED: adx_5m={adx_5m_val:.1f} adx_1m={adx_val:.1f} < 12 — no structure")
+        elif adx_for_filter < 20 and _adx_slope_3b <= 0 and not _5m_strong_trend:
+            # Contracting momentum AND still weak — penalise; rising ADX gets a pass.
+            # During tracked pullback: ADX naturally contracts as price retraces — suppress
+            # this penalty so the ideal entry at VWAP zone low is not blocked by expected
+            # pullback dynamics. Hard block (ADX < 12) still applies.
+            if not _in_tracked_pullback:
+                adx_penalty = (20 - adx_for_filter) / 20 * 0.10
+                conf -= adx_penalty
+                logger.debug(f"[Gate7c-ADX] contracting ADX penalty={adx_penalty:.3f} "
+                             f"(adx={adx_for_filter:.1f} slope={_adx_slope_3b:+.2f}) conf={conf:.3f}")
+            else:
+                logger.debug(f"[Gate7c-ADX] pullback phase — suppressing ADX contraction penalty "
+                             f"(adx={adx_for_filter:.1f} slope={_adx_slope_3b:+.2f})")
+        elif _5m_strong_trend and adx_val < 18:
+            logger.debug(f"[Gate7c-ADX] 1m ADX weak ({adx_val:.1f}) but 5m ADX strong ({adx_5m_val:.1f}) — skipping penalty")
 
-    # --- Gate 7c-ADX-MAX / CRISIS-ADX: overextension (hard blocks) -----------
-    if not crisis_bypass and adx_val > ADX_ENTRY_MAX:
-        return _block(f"[Gate7c-ADX-MAX] BLOCKED: adx={adx_val:.1f} > {ADX_ENTRY_MAX} — overextended")
+    # --- Gate 7c-ADX-MAX removed — strong trends should not be blocked -----------
+    # ADX_ENTRY_MAX=40 was blocking entries at peak trend strength (ADX=46 with TRENDING_DN).
+    # if not crisis_bypass and adx_val > ADX_ENTRY_MAX: return _block(...)
     if crisis_bypass and adx_val > ADX_CRISIS_MAX:
         return _block(f"[Gate7c-CRISIS-ADX] BLOCKED: adx={adx_val:.1f} > {ADX_CRISIS_MAX} in CRISIS")
 
@@ -1160,15 +1178,20 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
     # RSI extreme and staleness measure overlapping information (price has been
     # moving against signal direction for several bars). Cap their combined
     # contribution at 0.10 so a single theme can't deduct 0.14+ simultaneously.
+    # During tracked pullback: micro_regime may read TRENDING_DN during a valid UP
+    # pullback, accumulating staleness each bar (+0.05/bar). This is an expected
+    # read during the retracement — suppressing the penalty prevents the staleness
+    # state machine from blocking the ideal entry at the VWAP zone low.
+    # State is still updated (ss.update_staleness called) so it reflects reality
+    # when the pullback ends — only the conf deduction is skipped during tracking.
     stale_penalty = 0.0 if crisis_bypass else ss.update_staleness(micro_regime, direction)
-    if stale_penalty > 0:
-        # Apply only the excess above what RSI already deducted, up to the 0.10 cap
-        _rsi_stale_combined = rsi_penalty + stale_penalty
-        if _rsi_stale_combined > 0.10:
-            stale_penalty = max(0.0, 0.10 - rsi_penalty)
-            logger.debug(f"[Staleness] RSI+stale combined cap: rsi={rsi_penalty:.3f} stale capped to {stale_penalty:.3f}")
+    if stale_penalty > 0 and not _in_tracked_pullback:
+        stale_penalty = min(stale_penalty, 0.10)   # cap at 0.10
         conf -= stale_penalty
         logger.debug(f"[Staleness] penalty={stale_penalty:.3f} conf={conf:.3f}")
+    elif stale_penalty > 0 and _in_tracked_pullback:
+        logger.debug(f"[Staleness] pullback phase — suppressing stale_penalty={stale_penalty:.3f} "
+                     f"(micro_regime={micro_regime} direction={direction})")
 
     # --- Gate 7c IV crush ----------------------------------------------------
     iv_crush_penalty = check_iv_crush(row)
@@ -1189,23 +1212,26 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
     _META_HARD_BLOCK = 0.45
     if not crisis_bypass:
         if meta_conf < _META_HARD_BLOCK:
-            return _block(f"[Gate8b] BLOCKED: meta_labeler conf={meta_conf:.3f} < {_META_HARD_BLOCK} (anti-predictive)")
+            conf -= 0.05  # soft penalty — meta-labeler trained on <30 trades, hard block not justified
         elif meta_conf < MetaLabeler.META_CONF_THRESH:
             _meta_penalty = 0.08
             conf -= _meta_penalty
             logger.debug(f"[Gate8b] meta_labeler low conf penalty=-{_meta_penalty:.2f} "
                          f"(meta={meta_conf:.3f}) conf={conf:.3f}")
 
-    # --- Momentum: flat 5m return penalty ------------------------------------
-    # ADX penalty lives exclusively in Gate 7c-ADX above (no double-penalization).
-    _ret5m = float(row.get('ret_5m', 0.0))
-    if abs(_ret5m) < 0.001:
-        conf -= 0.05
-        logger.debug(f"[MomPenalty] flat 5m return penalty=-0.05 (ret5m={_ret5m:.4f}) conf={conf:.3f}")
+    # MomPenalty removed (trend-only, v4.1):
+    # ret_5m < 0.001 (flat 5m return) is already handled by EntryV4 — the pullback-resume
+    # gate requires vwap_dev_vel + tick_imbalance to confirm momentum before entry.
+    # A flat ret_5m during the pullback phase is expected and correct; penalising it
+    # here would block entries on valid pullback bars.
 
     # --- Gate 9: EV (deeply negative = hard block; marginal = soft penalty) --
-    p_win    = conf
-    p_loss   = 1.0 - conf
+    # Use raw_conf (pre-penalty blended confidence) for EV calculation.
+    # Post-penalty conf can go below 0.5 from stacked soft penalties on weak-but-valid
+    # market conditions, making EV negative even when the model has genuine edge.
+    # EV measures model prediction quality; penalties adjust entry confidence, not EV.
+    p_win    = raw_conf
+    p_loss   = 1.0 - raw_conf
     ev_raw   = p_win * EV_AVG_WIN_MULT - p_loss * EV_AVG_LOSS_MULT
     iv_rank_current  = float(row.get('iv_rank_approx', 50.0))
     iv_proxy_current = float(row.get('iv_proxy', 0.0))
@@ -1229,32 +1255,28 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
 
     ss.record_signal(direction, conf, current_regime, agreement=agreement)
 
-    # --- Gate 11b: dead-air penalty ------------------------------------------
-    if not crisis_bypass:
-        _vwap_vel   = float(row.get('vwap_dev_vel', 0.0))
-        _struct_11b = float(row.get('struct_score', 0.0))
-        _fvg_bull   = int(row.get('fvg_bull', 0))
-        _fvg_bear   = int(row.get('fvg_bear', 0))
-        if direction == 'UP':
-            _dead_air = _vwap_vel < -0.20 and _struct_11b <= 0.0 and _fvg_bull == 0
-        else:
-            _dead_air = _vwap_vel > 0.20 and _struct_11b >= 0.0 and _fvg_bear == 0
-        if _dead_air:
-            conf -= 0.10
-            logger.debug(f"[Gate11b] dead-air penalty=-0.10 "
-                         f"(vwap_vel={_vwap_vel:.3f} struct={_struct_11b:.2f}) conf={conf:.3f}")
+    # Gate 11b removed (trend-only, v4.1):
+    # Dead-air detection (vwap_dev_vel opposing + flat struct + no FVG) is superseded
+    # by EntryV4 which requires vwap_dev_vel + tick_imbalance to confirm RESUMPTION
+    # before the entry is allowed. If momentum is dead, EntryV4 blocks at the entry
+    # gate — no need to also penalise confidence here. Double-counting this signal
+    # was compressing conf artificially on valid pullback bars.
 
     # -------------------------------------------------------------------------
-    # PENALTY CAP: total soft-penalty reduction capped at 0.18.
-    # Raised from 0.15: with ~8 independent penalty categories the 0.15 cap was
-    # firing on legitimate multi-factor weak setups. 0.18 still prevents stacking
-    # from replicating a hard block while allowing meaningful differentiation.
+    # PENALTY CAP: total soft-penalty reduction capped at 0.10.
+    # FIX: lowered from 0.18 — the 0.18 cap allowed signals with 5-8 simultaneous
+    # negative conditions to survive. Three genuine penalty categories (e.g. ADX
+    # contraction + TA opposition + squeeze) already represent a bad setup and
+    # should fail the floor check. 0.10 restores multiplicative rejection power.
     # Cap applied AFTER all penalties and BEFORE the single final floor check.
     # -------------------------------------------------------------------------
     _total_reduction = raw_conf - conf
-    if _total_reduction > 0.18:
-        conf = raw_conf - 0.18
-        logger.debug(f"[PenaltyCap] {_total_reduction:.3f} reduction capped at 0.18 -> conf={conf:.3f}")
+    if _total_reduction > 0.20:
+        return _block(f"[PenaltyBudget] BLOCKED: total_penalty={_total_reduction:.3f} > 0.20 "
+                      f"(raw={raw_conf:.3f} dir={direction})")
+    if _total_reduction > 0.10:
+        conf = raw_conf - 0.10
+        logger.debug(f"[PenaltyCap] {_total_reduction:.3f} reduction capped at 0.10 -> conf={conf:.3f}")
 
     # -------------------------------------------------------------------------
     # FINAL FLOOR — single check, single variable.
@@ -1272,15 +1294,11 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
         f"dir={direction}"
     )
     if conf < _effective_floor:
-        # Soft buffer: if conf is within 0.02 below floor, allow through when
-        # agreement or meta-labeler is strong (genuine signal narrowly penalised).
-        _in_buffer = (_effective_floor - conf) <= 0.02
-        _buffer_pass = _in_buffer and (agreement > 0.60 or _meta_conf_for_blend > 0.60)
-        if not _buffer_pass:
-            return _block(f"[FinalFloor] BLOCKED: conf={conf:.3f} < floor={_effective_floor:.3f} "
-                          f"(raw={raw_conf:.3f} reduction={_total_reduction:.3f})")
-        logger.info(f"[FinalFloor] buffer pass: conf={conf:.3f} within 0.02 of floor={_effective_floor:.3f} "
-                    f"agreement={agreement:.3f} meta={_meta_conf_for_blend:.3f}")
+        # FIX: removed soft buffer — the 0.02-below-floor pass with agreement>0.60
+        # was allowing signals that failed the floor to re-enter on a weak majority.
+        # The floor is the floor. A conf of 0.50 when floor is 0.52 does not have edge.
+        return _block(f"[FinalFloor] BLOCKED: conf={conf:.3f} < floor={_effective_floor:.3f} "
+                      f"(raw={raw_conf:.3f} reduction={_total_reduction:.3f})")
 
     # --- Final selective-entry filters ---------------------------------------
     # These run after final confidence is known and before execution-level
@@ -1298,13 +1316,8 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
             logger.info(f"[SKIP] [FinalSelect] adx={_adx_final:.1f} < 12")
             return None
 
-    if 'ret_5m' in row.index:
-        _ret5m_final = row.get('ret_5m', None)
-        if _ret5m_final is not None and not pd.isna(_ret5m_final):
-            _ret5m_final = float(_ret5m_final)
-            if abs(_ret5m_final) < 0.001:
-                logger.info(f"[SKIP] [FinalSelect] abs(ret_5m)={abs(_ret5m_final):.4f} < 0.001")
-                return None
+    # FinalSelect ret_5m check removed (trend-only, v4.1):
+    # Duplicate of EntryV4 momentum check — see MomPenalty removal note above.
 
     if final_conf > 0.60 and agreement < 0.55:
         logger.info(f"[SKIP] [FinalSelect] final_conf={final_conf:.3f} > 0.60 but agreement={agreement:.3f} < 0.55")
@@ -1319,20 +1332,147 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
         logger.info(f"[SKIP] [FinalSelect] trades_today={_trades_today_total} >= 10")
         return None
 
-    # Alias for downstream code that still references adj_conf (return dict, micro-confirm)
+    # Alias for downstream code that still references adj_conf (return dict)
     adj_conf = conf
 
-    # 7️⃣ Entry Micro-Confirmation (FINAL EXECUTION FILTER)
-    # WHY: Models can signal too early. Require price to demonstrate commitment.
-    # Use SignalState's vwap_history (reset daily, no memory leak).
-    # Rule: 2 consecutive bars above/below VWAP OR strong directional candle.
-    # CRISIS bypass: still run for VWAP history update, but don't block on result.
-    micro_pass, micro_reason = check_entry_micro_confirmation(
-        row, direction, ss.vwap_history,
-        micro_regime=micro_regime, avg_conf=adj_conf
-    )
-    if not micro_pass and not crisis_bypass:
-        return _block(f"[Gate] BLOCKED: micro_confirmation={micro_reason}")
+    # ==========================================================================
+    # ENTRY GATE v4.0: PULLBACK-RESUME  (replaces MomGate + 2-bar VWAP confirm)
+    #
+    # Design rationale (from quant review):
+    #   Old entry: required ret_1m > 0.35×ATR AND 2 consecutive VWAP bars.
+    #   Both conditions confirm an EXISTING move → systematic entry 3–6 bars late.
+    #   The 10% premium stop fires on the natural pullback that follows any burst.
+    #
+    # New entry: two phases per signal.
+    #   Phase 1 — TREND IDENTIFIED (current bar):
+    #     All upstream gates cleared → trend is confirmed.
+    #     If price is already in the VWAP zone (within 1×ATR), skip to Phase 2
+    #     immediately (price pulled back before model fired — ideal setup).
+    #     Otherwise record the direction and wait.
+    #
+    #   Phase 2 — PULLBACK COMPLETE → ENTRY:
+    #     On subsequent bars (tracked via ss._pb_*), wait for price to retest
+    #     the VWAP zone, then enter on the first bar that resumes the direction.
+    #     Resumption signal: vwap_dev_vel moving in direction + tick_imbalance aligned.
+    #     Expires after _pb_max_bars (12 bars / ~12 min) to avoid stale setups.
+    #
+    # CRISIS bypass: skip entirely — V-recovery entries should not wait for pullback.
+    # ==========================================================================
+
+    _close_now  = float(row.get('close', 0.0))
+    _vwap_now   = float(row.get('vwap', 0.0))
+    _atr14_now  = float(row.get('atr_14', 1.0)) or 1.0
+    _vwap_vel   = float(row.get('vwap_dev_vel', 0.0))   # 3-bar diff of vwap_dist (%)
+    _tick_imb   = float(row.get('tick_imbalance', 0.0))  # 20-bar rolling tick direction
+
+    # "In VWAP zone" = price within 1×ATR of VWAP (either side)
+    _in_vwap_zone = abs(_close_now - _vwap_now) <= _atr14_now if _vwap_now > 0 else False
+
+    # Real-time momentum: vwap_dev_vel positive = price moving AWAY from VWAP upward.
+    # tick_imbalance > 0 = buy-side pressure dominant.
+    # These are bar-level (not 14-bar averages) — they measure what is happening NOW.
+    # FIX: raised from 0.02/0.05 — old thresholds were noise-level (~4pt VWAP move, 1 net uptick).
+    # 0.08 vwap_dev_vel ≈ 17+ points directional move in 3 bars (real resumption candle).
+    # 0.15 tick_imbalance = net 3 more upticks than downticks in 20 bars (filters dead-air).
+    _resuming_up   = _vwap_vel > 0.08 and _tick_imb > 0.15
+    _resuming_down = _vwap_vel < -0.08 and _tick_imb < -0.15
+
+    if not crisis_bypass:
+        # ---- Update VWAP history (still maintained for any downstream consumer) ----
+        _vwap_pos = 1 if _close_now > _vwap_now else 0
+        ss.vwap_history.append(_vwap_pos)
+
+        # ---- Phase 1: is there an active pending setup? -------------------------
+        if ss._pb_direction is not None:
+            # Advance the bar counter — expire stale setups
+            ss._pb_bars_since_signal += 1
+            if ss._pb_bars_since_signal > ss._pb_max_bars:
+                logger.debug(f"[EntryV4] pullback setup expired after {ss._pb_bars_since_signal} bars "
+                             f"(direction={ss._pb_direction})")
+                ss._pb_direction = None
+                ss._pb_touched_vwap = False
+                ss._pb_bars_since_signal = 0
+
+        # ---- New setup registered on this bar -----------------------------------
+        # If no pending setup, register the trend identification produced by the
+        # upstream gates on this bar.
+        if ss._pb_direction is None:
+            if _in_vwap_zone:
+                # Price is already at VWAP — no need to wait; treat as immediate
+                # pullback-complete. Fall through to resumption check below.
+                ss._pb_direction = direction
+                ss._pb_touched_vwap = True
+                ss._pb_bars_since_signal = 0
+                logger.debug(f"[EntryV4] trend={direction} price already in VWAP zone "
+                             f"(close={_close_now:.1f} vwap={_vwap_now:.1f} atr={_atr14_now:.1f}) "
+                             f"→ immediate pullback-complete")
+            else:
+                # Price extended away from VWAP — register and wait for retest
+                ss._pb_direction = direction
+                ss._pb_touched_vwap = False
+                ss._pb_bars_since_signal = 0
+                logger.debug(f"[EntryV4] trend={direction} registered, waiting for VWAP retest "
+                             f"(close={_close_now:.1f} vwap={_vwap_now:.1f} dist={abs(_close_now-_vwap_now):.1f}pt)")
+                return _block(f"[EntryV4] WAIT: {direction} trend identified, awaiting VWAP pullback "
+                              f"(dist={abs(_close_now-_vwap_now):.1f}pt > 1×ATR={_atr14_now:.1f}pt)")
+
+        # ---- Phase 2: active setup — check for pullback then resumption --------
+        if ss._pb_direction == direction:
+            # Mark if we've touched the VWAP zone since the setup was registered
+            if _in_vwap_zone:
+                ss._pb_touched_vwap = True
+                logger.debug(f"[EntryV4] {direction} setup touched VWAP zone "
+                             f"(bar {ss._pb_bars_since_signal})")
+
+            if not ss._pb_touched_vwap:
+                # Still waiting for the pullback — do not enter yet
+                return _block(f"[EntryV4] WAIT: {direction} pullback not yet reached VWAP zone "
+                              f"(bar {ss._pb_bars_since_signal}/{ss._pb_max_bars})")
+
+            # Pullback has occurred — require resumption momentum to enter
+            _resuming = _resuming_up if direction == 'UP' else _resuming_down
+            if not _resuming:
+                # Reached VWAP but momentum not yet resuming — brief wait
+                # Allow entry after 2 bars at VWAP regardless (avoids infinite wait)
+                if ss._pb_bars_since_signal < ss._pb_max_bars - 2:
+                    return _block(f"[EntryV4] WAIT: {direction} at VWAP, awaiting resumption "
+                                  f"(vwap_vel={_vwap_vel:+.3f} tick={_tick_imb:+.3f})")
+                else:
+                    # Near expiry — relax to single VWAP-side check to avoid missing the entry
+                    _on_correct_side = (_close_now > _vwap_now) if direction == 'UP' else (_close_now < _vwap_now)
+                    if not _on_correct_side:
+                        return _block(f"[EntryV4] BLOCKED: {direction} at VWAP zone expiry, "
+                                      f"price on wrong side (close={_close_now:.1f} vwap={_vwap_now:.1f})")
+                    logger.debug(f"[EntryV4] {direction} expiry-allow: bar {ss._pb_bars_since_signal}, "
+                                 f"price on correct VWAP side")
+
+            # ENTRY ALLOWED — clear the pending setup so next bar starts fresh
+            logger.info(f"[EntryV4] ENTRY: {direction} pullback-resume confirmed "
+                        f"(bar {ss._pb_bars_since_signal} vwap_vel={_vwap_vel:+.3f} "
+                        f"tick={_tick_imb:+.3f} close={_close_now:.1f} vwap={_vwap_now:.1f})")
+            ss._pb_direction = None
+            ss._pb_touched_vwap = False
+            ss._pb_bars_since_signal = 0
+
+        else:
+            # Direction of pending setup flipped (e.g. was UP, now DOWN) — discard
+            logger.debug(f"[EntryV4] direction flipped ({ss._pb_direction}→{direction}), resetting setup")
+            ss._pb_direction = None
+            ss._pb_touched_vwap = False
+            ss._pb_bars_since_signal = 0
+            # Register new direction and wait (same as new-setup branch above)
+            if _in_vwap_zone:
+                ss._pb_direction = direction
+                ss._pb_touched_vwap = True
+            else:
+                ss._pb_direction = direction
+                return _block(f"[EntryV4] WAIT: direction flipped to {direction}, awaiting VWAP retest")
+
+    else:
+        # CRISIS bypass: maintain VWAP history but skip pullback logic entirely
+        _vwap_pos = 1 if _close_now > _vwap_now else 0
+        ss.vwap_history.append(_vwap_pos)
+        logger.debug(f"[EntryV4] CRISIS bypass — skipping pullback gate")
 
     strength = ('STRONG'   if adj_conf >= CONF_STRONG else
                 'MODERATE' if adj_conf >= CONF_MODERATE else
@@ -1474,3 +1614,547 @@ def generate_signal(row: pd.Series, models: dict, current_regime: int,
     }
 
 
+# ===========================================================================
+# V5 CLEAN SIGNAL GENERATOR
+# ===========================================================================
+# Implements the design exactly:
+#   Gate 1: TRENDING regime only (ADX-based, from live_regime_from_row)
+#   Gate 2: Session window 09:30–14:15
+#   Gate 3: IV rank < 80th percentile
+#   ML:     15m + 30m weighted vote  →  P(direction) ≥ V5_CONF_ENTRY (0.60)
+#   Align:  ML direction must match regime direction
+#   Entry:  Pullback-resume (EntryV5)
+#
+# Returns the same dict structure as generate_signal() so callers are interchangeable.
+# ===========================================================================
+
+def generate_signal_v5(
+    row: pd.Series,
+    models: dict,
+    current_regime: int,
+    micro_regime: str = 'UNKNOWN',
+    signal_state: 'SignalState | None' = None,
+    extra_conf_floor: float = 0.0,
+    crisis_bypass: bool = False,
+    regime_conf: float = 0.5,
+    v5_risk_state: 'V5RiskState | None' = None,
+    capital: float = 100_000.0,
+) -> 'dict | None':
+    """
+    v5 clean trend-following signal generator.
+
+    Strategy: TRENDING only → pullback to VWAP → momentum resumes → enter CE/PE.
+
+    Three hard filters (in order):
+      1. Regime gate:  TRENDING required (live_regime_from_row or current_regime arg)
+      2. Session gate: 09:30–14:15 window
+      3. IV rank gate: iv_rank_approx < V5_IV_RANK_MAX (80th percentile)
+
+    ML direction:
+      - 15m and 30m models vote (weighted 60/40)
+      - P(direction) must exceed V5_CONF_ENTRY (0.60) to proceed
+      - ML direction must agree with regime swing structure
+
+    Entry gate (EntryV5 — two-phase pullback-resume):
+      Phase 1: Trend confirmed → register direction, wait for VWAP retest
+               OR enter immediately if already in VWAP zone
+      Phase 2: Price touches VWAP zone (+prior impulse still intact)
+               → wait for momentum resumption bar (vwap_dev_vel + tick_imbalance)
+               → ENTER on bar close
+
+    Session risk gates (V5RiskState — called before entry execution):
+      • Max 3 trades per day (1 on gap days)
+      • Daily loss limit Rs 1,500
+      • 15-min cooldown after 2 consecutive losses
+      • Rolling WR guard: pause if last 5 trades WR < 35%
+
+    Args:
+        row:            Current bar feature vector (pd.Series).
+        models:         Dict of {horizon: model_dict} from trainer.
+        current_regime: Integer regime code (REGIME_TRENDING / REGIME_RANGING).
+        micro_regime:   String micro-regime label (unused for hard gates in v5).
+        signal_state:   Per-session SignalState; uses module singleton if None.
+        extra_conf_floor: Additional confidence floor.
+        crisis_bypass:  If True, bypass regime/session/IV gates (V-recovery mode).
+        regime_conf:    HMM certainty [0,1]; used to blend regime/global model.
+        v5_risk_state:  V5RiskState instance; uses module singleton if None.
+        capital:        Trading capital in Rs (for lot sizing).
+
+    Returns:
+        dict with signal info (includes 'lots' key) if entry is allowed, else None.
+        Sets last_block_reason for callers that want to know why.
+    """
+    ss  = signal_state if signal_state is not None else _signal_state
+    vrs = v5_risk_state if v5_risk_state is not None else _v5_risk_state
+
+    global last_block_reason
+    last_block_reason = ""
+
+    mod = int(row.get('minute_of_day', 0))
+    sp  = float(row.get('session_pct', 0.0))
+
+    # -----------------------------------------------------------------------
+    # GATE 1: Regime — TRENDING only
+    # -----------------------------------------------------------------------
+    if not crisis_bypass and current_regime != REGIME_TRENDING:
+        return _block(
+            f"[V5-Gate1] BLOCKED: regime={REGIME_NAMES.get(current_regime, '?')} "
+            f"— only TRENDING allowed"
+        )
+
+    # -----------------------------------------------------------------------
+    # GATE 2: Session window — 09:30–14:15 (mod 15–300)
+    # Block first 15 min (open noise) and last 75 min (close theta decay).
+    # -----------------------------------------------------------------------
+    if not crisis_bypass:
+        if mod < V5_ENTRY_MOD_MIN or mod > V5_ENTRY_MOD_MAX or sp > 0.92:
+            return _block(
+                f"[V5-Gate2] BLOCKED: outside session window "
+                f"(mod={mod}, sp={sp:.2f})"
+            )
+
+    # -----------------------------------------------------------------------
+    # GATE 3: IV rank filter — avoid overpriced options
+    # iv_rank_approx = percentile of current IV vs 20-day rolling history.
+    # Above 80th percentile = premium is expensive → theta drag dominates.
+    # -----------------------------------------------------------------------
+    if not crisis_bypass:
+        iv_rank = float(row.get('iv_rank_approx', row.get('iv_rank', 50.0)))
+        if iv_rank > V5_IV_RANK_MAX:
+            return _block(
+                f"[V5-Gate3] BLOCKED: iv_rank={iv_rank:.1f} > {V5_IV_RANK_MAX} "
+                f"— options overpriced"
+            )
+
+    # -----------------------------------------------------------------------
+    # GATE 4: Event-day filter
+    # Scheduled macro events (RBI policy, Fed, index rebalancing) create
+    # vol spikes that invalidate the trend-following model's assumptions.
+    # Caller sets row['event_day'] = 1 for known event days.
+    # -----------------------------------------------------------------------
+    if not crisis_bypass and int(row.get('event_day', 0)) == 1:
+        return _block("[V5-Gate4] BLOCKED: event_day=1 — scheduled macro event")
+
+    # -----------------------------------------------------------------------
+    # GATE 5: Session-level risk (V5RiskState)
+    # Checked here (before ML inference) to avoid wasting compute.
+    # -----------------------------------------------------------------------
+    if not crisis_bypass:
+        _risk_ok, _risk_reason = vrs.check_entry(now=datetime.now())
+        if not _risk_ok:
+            return _block(_risk_reason)
+
+    # -----------------------------------------------------------------------
+    # INPUT VALIDATION
+    # -----------------------------------------------------------------------
+    active_features = None
+    if models:
+        first_model = next(iter(models.values()))
+        active_features = first_model.get('active_features')
+    if active_features is None:
+        from ..features.feature_engineering import FEATURE_COLS, FEATURE_LIVE_OK
+        active_features = [f for f in FEATURE_COLS if FEATURE_LIVE_OK.get(f, True)]
+
+    is_valid, error_msg, _ = validate_model_inputs(row, active_features)
+    if not is_valid:
+        return _block(f"[V5-InputCheck] BLOCKED: {error_msg}")
+
+    X_raw = np.array(
+        [[0.0 if pd.isna(row.get(c, 0)) else float(row.get(c, 0))
+          for c in active_features]],
+        dtype=np.float32,
+    )
+
+    # Apply walk-forward scaler (mandatory — raw features on scaled model = garbage)
+    first_model_for_scaler = models.get(15) or models.get(30) or (
+        next(iter(models.values())) if models else None
+    )
+    live_scaler = first_model_for_scaler.get('live_scaler') if first_model_for_scaler else None
+    if live_scaler is None:
+        raise RuntimeError(
+            "[V5] CRITICAL: live_scaler is None. Models need scaled input. "
+            "Retrain or restore model artifact with live_scaler."
+        )
+    if hasattr(live_scaler, 'n_features_in_') and live_scaler.n_features_in_ != X_raw.shape[1]:
+        raise RuntimeError(
+            f"[V5] CRITICAL: scaler expects {live_scaler.n_features_in_} features, "
+            f"got {X_raw.shape[1]}. Retrain models."
+        )
+    X = live_scaler.transform(X_raw)
+
+    # -----------------------------------------------------------------------
+    # ML VOTING — 15m + 30m only (V5_HORIZONS)
+    # -----------------------------------------------------------------------
+    vote_up   = 0.0
+    vote_dn   = 0.0
+    total_w   = 0.0
+    conf_wsum = 0.0
+    conf_wden = 0.0
+    signals   = {}
+    n_valid   = 0
+
+    for h in V5_HORIZONS:
+        res = models.get(h)
+        if res is None or res.get('final_model') is None:
+            logger.warning(f"[V5-ML] h={h}m model missing — skipping")
+            continue
+        try:
+            global_model = res['final_model']
+            proba_g = global_model.predict_proba(X)[0]
+            if len(proba_g) != 2 or np.any(np.isnan(proba_g)):
+                logger.warning(f"[V5-ML] h={h}m invalid output {proba_g}")
+                continue
+
+            # Blend with regime-specific model when available
+            regime_mdl = res.get('regime_models', {}).get(current_regime)
+            if regime_mdl is not None:
+                proba_r = regime_mdl.predict_proba(X)[0]
+                if len(proba_r) == 2 and not np.any(np.isnan(proba_r)):
+                    p = regime_conf * proba_r[1] + (1.0 - regime_conf) * proba_g[1]
+                else:
+                    p = proba_g[1]
+            else:
+                p = proba_g[1]
+
+            p = float(np.clip(p, 0.45, 0.82))   # Platt-calibration range
+            pred = 1 if p > 0.5 else 0
+            conf = p if pred == 1 else (1.0 - p)
+
+            signals[h] = {'pred': pred, 'conf': conf, 'proba': p}
+            n_valid += 1
+
+            w = V5_HORIZON_WEIGHTS.get(h, 0.5)
+            if pred == 1:
+                vote_up += w * conf
+            else:
+                vote_dn += w * conf
+            total_w   += w * conf
+            # conf_wsum / conf_wden: only include models that agree with dominant direction.
+            # Bug: previously accumulated ALL models' confidences regardless of direction,
+            # causing avg_conf to be polluted by opposing-direction predictions and
+            # reporting artificially low confidence on high-agreement signals.
+            # Deferred: direction is known only after all models run; we record per-model
+            # data now and compute avg_conf after determining the dominant direction below.
+            signals[h]['_w']    = w
+            signals[h]['_pred'] = pred
+            signals[h]['_conf'] = conf
+
+            logger.info(
+                f"[V5-ML] h={h}m pred={'UP' if pred==1 else 'DN'} "
+                f"conf={conf:.3f} p_up={p:.3f}"
+            )
+        except Exception as exc:
+            logger.error(f"[V5-ML] h={h}m prediction failed: {exc}")
+            continue
+
+    if n_valid == 0 or total_w == 0:
+        return _block("[V5-ML] BLOCKED: no valid model outputs")
+
+    # Direction from weighted vote
+    direction = 'UP' if vote_up >= vote_dn else 'DOWN'
+    agreement = (vote_up if direction == 'UP' else vote_dn) / total_w
+
+    # Require clear majority (≥ 60% of weighted vote)
+    if agreement < V5_CONF_ENTRY:
+        return _block(
+            f"[V5-ML] BLOCKED: ML confidence={agreement:.3f} < {V5_CONF_ENTRY} "
+            f"— insufficient directional conviction"
+        )
+
+    # Weighted-average confidence: only models that agree with the winning direction.
+    # Avoids inflation from opposing models (e.g. 15m=UP 0.65 + 30m=DN 0.60 → avg was 0.625
+    # even though 30m disagreed — now avg_conf reflects only the UP-agreeing models).
+    _win_pred = 1 if direction == 'UP' else 0
+    conf_wsum = sum(
+        signals[h]['_w'] * signals[h]['_conf']
+        for h in signals
+        if signals[h].get('_pred') == _win_pred
+    )
+    conf_wden = sum(
+        signals[h]['_w']
+        for h in signals
+        if signals[h].get('_pred') == _win_pred
+    )
+    avg_conf = conf_wsum / conf_wden if conf_wden > 0 else 0.0
+
+    # -----------------------------------------------------------------------
+    # DIRECTION-REGIME ALIGNMENT
+    # ML direction must match the regime's swing structure.
+    # Regime says UPTREND → only CE (UP) signals allowed and vice versa.
+    # -----------------------------------------------------------------------
+    if not crisis_bypass:
+        regime_direction = _regime_swing_direction(row)
+        if regime_direction != 'NEUTRAL' and regime_direction != direction:
+            return _block(
+                f"[V5-Align] BLOCKED: ML={direction} but regime structure={regime_direction} "
+                f"— direction conflict"
+            )
+
+    # -----------------------------------------------------------------------
+    # ENTRY GATE V5: PULLBACK → RESUME
+    #
+    # Two phases per signal:
+    #   Phase 1: Trend confirmed (all gates cleared on this bar)
+    #            → if price is already in VWAP zone, go directly to Phase 2
+    #            → otherwise register direction and wait for VWAP retest
+    #
+    #   Phase 2: VWAP zone reached AND impulse structure still intact
+    #            → wait for momentum resumption bar
+    #            → ENTER on that bar close
+    #
+    # Expiry logic: setup expires after V5_PB_MAX_WAIT_BARS bars.
+    # Crisis bypass: skip pullback gate entirely.
+    # -----------------------------------------------------------------------
+    if not crisis_bypass:
+        entry_allowed, entry_block_msg = _entry_v5(row, direction, ss)
+        if not entry_allowed:
+            return _block(entry_block_msg)
+
+    # -----------------------------------------------------------------------
+    # STRIKE AND PREMIUM CALCULATION (unchanged from v4)
+    # -----------------------------------------------------------------------
+    iv_proxy_val = float(row.get('iv_proxy', 0.0))
+    iv = iv_proxy_val if iv_proxy_val > 0 else float(row.get('atr_14_pct', 0.06))
+    iv_daily  = safe_value(iv) if iv > 0 else 0.06
+    iv_annpct = iv_daily * np.sqrt(252)
+
+    spot      = safe_value(row.get('close', 0))
+    atr_now   = safe_value(row.get('atr_14', 0))
+    dte_mins  = _next_expiry_mins()
+
+    atm       = int(round(spot / STRIKE_ROUNDING) * STRIKE_ROUNDING)
+    strike_ce = atm
+    strike_pe = atm
+
+    ce_ltp = safe_value(row.get('atm_ce_ltp', 0))
+    pe_ltp = safe_value(row.get('atm_pe_ltp', 0))
+    if ce_ltp <= 0:
+        ce_ltp = estimate_option_premium(spot, iv_annpct, dte_mins,
+                                          strike=float(strike_ce), option_type='CE')
+    if pe_ltp <= 0:
+        pe_ltp = estimate_option_premium(spot, iv_annpct, dte_mins,
+                                          strike=float(strike_pe), option_type='PE')
+
+    # -----------------------------------------------------------------------
+    # POSITION SIZING
+    # Compute lots now (after entry gate) so the signal dict carries the
+    # confirmed size. Callers (live.py / paper.py) use signal['lots'] directly.
+    # -----------------------------------------------------------------------
+    _entry_premium = ce_ltp if direction == 'UP' else pe_ltp
+    _vix_now       = float(row.get('vix_level', row.get('vix', 15.0)))
+    lots = v5_lot_size(capital=capital, premium=_entry_premium, vix=_vix_now)
+
+    # -----------------------------------------------------------------------
+    # RECORD SIGNAL
+    # -----------------------------------------------------------------------
+    ss.record_signal(direction, avg_conf, current_regime, agreement=agreement)
+
+    strength = ('STRONG'   if avg_conf >= V5_CONF_STRONG else
+                'MODERATE' if avg_conf >= V5_CONF_ENTRY  else
+                'WEAK')
+
+    time_decay_mult = calculate_time_decay_confidence(mod)
+
+    logger.info(
+        f"[V5-SIGNAL] {direction} {strength} conf={avg_conf:.3f} "
+        f"agree={agreement:.3f} lots={lots} mod={mod} "
+        f"regime={REGIME_NAMES.get(current_regime,'?')}"
+    )
+
+    return {
+        'direction':           direction,
+        'strength':            strength,
+        'avg_conf':            round(avg_conf, 4),
+        'raw_conf':            round(avg_conf, 4),
+        'stale_penalty':       0.0,
+        'iv_crush_penalty':    0.0,
+        'agreement':           round(agreement, 4),
+        'regime':              REGIME_NAMES.get(current_regime, '?'),
+        'micro_regime':        micro_regime,
+        'signals':             signals,
+        'spot':                float(row.get('close', 0)),
+        'iv_proxy':            float(iv),
+        'session':             float(sp),
+        'w_up':                round(vote_up, 4),
+        'w_dn':                round(vote_dn, 4),
+        'n_valid':             n_valid,
+        'ev_raw':              0.0,
+        'ev_net':              0.0,
+        'conf_pctile':         0.0,
+        'season_bias':         0.0,
+        'conf_floor':          V5_CONF_ENTRY,
+        'meta_conf':           1.0,
+        'in_transition_zone':  False,
+        'minute_of_day':       mod,
+        'is_expiry':           int(row.get('is_expiry', 0)),
+        'time_decay_mult':     round(time_decay_mult, 3),
+        'ofi_boost':           0.0,
+        'atr_current':         float(row.get('atr_14', 0)),
+        'fft_cycle':           float(row.get('fft_cycle', 0)),
+        'frac_diff':           float(row.get('frac_diff_close', 0)),
+        'strike_ce':           strike_ce,
+        'strike_pe':           strike_pe,
+        'ce_ltp_current':      round(ce_ltp, 2),
+        'pe_ltp_current':      round(pe_ltp, 2),
+        'dynamic_projections': {},
+        # V5-specific fields
+        'generator_version':   'v5',
+        'stop_pct':            V5_STOP_PCT,
+        'target_pct':          V5_TARGET_PCT,
+        'lots':                lots,
+        'risk_state':          vrs.summary(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# V5 helpers
+# ---------------------------------------------------------------------------
+
+def _regime_swing_direction(row: pd.Series) -> str:
+    """
+    Extract regime swing direction from pre-computed structure flags.
+    Returns 'UP', 'DOWN', or 'NEUTRAL'.
+    """
+    hh = int(row.get('higher_high_flag', 0))
+    hl = int(row.get('higher_low_flag',  0))
+    lh = int(row.get('lower_high_flag',  0))
+    ll = int(row.get('lower_low_flag',   0))
+
+    if hh == 1 and hl == 1:
+        return 'UP'
+    if lh == 1 and ll == 1:
+        return 'DOWN'
+    return 'NEUTRAL'
+
+
+def _entry_v5(row: pd.Series, direction: str,
+               ss: 'SignalState') -> 'tuple[bool, str]':
+    """
+    EntryV5: two-phase pullback-resume gate.
+
+    Returns (entry_allowed: bool, reason: str).
+    True = proceed to entry; False = block with reason.
+
+    State stored in SignalState._pb_* attributes (shared with EntryV4).
+    """
+    close_now = float(row.get('close', 0.0))
+    vwap_now  = float(row.get('vwap', 0.0))
+    atr14_now = float(row.get('atr_14', 1.0)) or 1.0
+    vwap_vel  = float(row.get('vwap_dev_vel', 0.0))
+    tick_imb  = float(row.get('tick_imbalance', 0.0))
+
+    # "In VWAP zone" = price within V5_PB_VWAP_BAND_PCT of VWAP
+    # Use ATR as a fallback if VWAP band would be too tight
+    vwap_band = max(vwap_now * V5_PB_VWAP_BAND_PCT, atr14_now * 0.5) if vwap_now > 0 else atr14_now
+    in_vwap_zone = (abs(close_now - vwap_now) <= vwap_band) if vwap_now > 0 else False
+
+    # Momentum resumption signals (real-time, not lagging)
+    resuming_up   = vwap_vel > V5_MOM_VWAP_VEL_MIN  and tick_imb > V5_MOM_TICK_IMB_MIN
+    resuming_down = vwap_vel < -V5_MOM_VWAP_VEL_MIN and tick_imb < -V5_MOM_TICK_IMB_MIN
+    resuming      = resuming_up if direction == 'UP' else resuming_down
+
+    # Maintain VWAP position history
+    ss.vwap_history.append(1 if close_now > vwap_now else 0)
+
+    # --- Advance or expire any existing pending setup ---
+    if ss._pb_direction is not None:
+        ss._pb_bars_since_signal += 1
+        if ss._pb_bars_since_signal > V5_PB_MAX_WAIT_BARS:
+            logger.debug(
+                f"[EntryV5] setup expired after {ss._pb_bars_since_signal} bars "
+                f"(direction={ss._pb_direction})"
+            )
+            ss._pb_direction       = None
+            ss._pb_touched_vwap    = False
+            ss._pb_bars_since_signal = 0
+
+    # --- Direction flip: discard old setup ---
+    if ss._pb_direction is not None and ss._pb_direction != direction:
+        logger.debug(
+            f"[EntryV5] direction flipped {ss._pb_direction}→{direction}, resetting"
+        )
+        ss._pb_direction       = None
+        ss._pb_touched_vwap    = False
+        ss._pb_bars_since_signal = 0
+
+    # --- No pending setup: register this bar's trend identification ---
+    if ss._pb_direction is None:
+        ss._pb_direction       = direction
+        ss._pb_bars_since_signal = 0
+
+        if in_vwap_zone:
+            # Already at VWAP — immediate pullback-complete
+            ss._pb_touched_vwap = True
+            logger.debug(
+                f"[EntryV5] {direction}: price already in VWAP zone "
+                f"(close={close_now:.1f} vwap={vwap_now:.1f}) → immediate"
+            )
+            # Fall through to Phase 2 resumption check below
+        else:
+            ss._pb_touched_vwap = False
+            logger.debug(
+                f"[EntryV5] {direction}: registered, waiting for VWAP retest "
+                f"(close={close_now:.1f} vwap={vwap_now:.1f} "
+                f"dist={abs(close_now - vwap_now):.1f}pt)"
+            )
+            return False, (
+                f"[EntryV5] WAIT: {direction} trend identified, "
+                f"awaiting VWAP pullback (dist={abs(close_now-vwap_now):.1f}pt)"
+            )
+
+    # --- Phase 2: pending setup active — track pullback and resumption ---
+    if ss._pb_direction == direction:
+
+        # Mark when price reaches VWAP zone
+        if in_vwap_zone:
+            ss._pb_touched_vwap = True
+            logger.debug(
+                f"[EntryV5] {direction}: touched VWAP zone "
+                f"(bar {ss._pb_bars_since_signal})"
+            )
+
+        # Still waiting for the pullback
+        if not ss._pb_touched_vwap:
+            return False, (
+                f"[EntryV5] WAIT: {direction} pullback not yet at VWAP "
+                f"(bar {ss._pb_bars_since_signal}/{V5_PB_MAX_WAIT_BARS})"
+            )
+
+        # Pullback reached — require momentum resumption
+        if not resuming:
+            # Allow up to 2 extra bars at VWAP for resumption to develop
+            bars_at_vwap = ss._pb_bars_since_signal
+            if bars_at_vwap < V5_PB_MAX_WAIT_BARS - 2:
+                return False, (
+                    f"[EntryV5] WAIT: {direction} at VWAP, awaiting resumption "
+                    f"(vel={vwap_vel:+.3f} tick={tick_imb:+.3f})"
+                )
+            # Near expiry of setup — use simple side check
+            on_correct_side = (
+                (close_now > vwap_now) if direction == 'UP' else (close_now < vwap_now)
+            )
+            if not on_correct_side:
+                ss._pb_direction       = None
+                ss._pb_touched_vwap    = False
+                ss._pb_bars_since_signal = 0
+                return False, (
+                    f"[EntryV5] EXPIRED: {direction} price crossed VWAP "
+                    f"to wrong side (close={close_now:.1f} vwap={vwap_now:.1f})"
+                )
+            logger.debug(
+                f"[EntryV5] {direction}: setup near-expiry allow "
+                f"(bar {ss._pb_bars_since_signal}, price on correct side)"
+            )
+
+        # ENTRY ALLOWED — clear setup state
+        logger.info(
+            f"[EntryV5] ENTRY: {direction} pullback-resume confirmed "
+            f"(bar {ss._pb_bars_since_signal} "
+            f"vel={vwap_vel:+.3f} tick={tick_imb:+.3f} "
+            f"close={close_now:.1f} vwap={vwap_now:.1f})"
+        )
+        ss._pb_direction       = None
+        ss._pb_touched_vwap    = False
+        ss._pb_bars_since_signal = 0
+
+    return True, ""
